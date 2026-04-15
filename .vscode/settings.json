@@ -1,0 +1,15 @@
+{
+    "[lua]": {
+		"editor.defaultFormatter": "yinfei.luahelper"
+	},
+	"luahelper.format.break_after_operator": false,
+	"luahelper.format.column_limit": 480,
+	"luahelper.format.use_tab": true,
+	"luahelper.format.continuation_indent_width": 1,
+	"luahelper.format.tab_width": 1,
+	"luahelper.format.indent_width": 1,
+	"luahelper.format.line_breaks_after_function_body": 2,
+	"luahelper.format.align_table_field": false,
+	"luahelper.format.break_after_table_lb": true,
+	"luahelper.format.extra_sep_at_table_end": true,
+}
