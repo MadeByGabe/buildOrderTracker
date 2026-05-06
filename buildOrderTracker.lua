@@ -121,8 +121,12 @@ local function calculateTotalBuildPower(teamID)
 end
 
 
-local function isArmedUnit(unitDef)
-	return unitDef.weapons and (#unitDef.weapons > 0) and not unitDef.customParams.iscommander
+local function isArmyUnit(unitDef)
+	return unitDef.weapons and (#unitDef.weapons > 0) and not unitDef.customParams.iscommander and (unitDef.speed or 0) > 0
+end
+
+local function isDefenceUnit(unitDef)
+	return unitDef.weapons and (#unitDef.weapons > 0) and not unitDef.customParams.iscommander and (unitDef.speed or 0) == 0
 end
 
 
@@ -154,12 +158,12 @@ local function exportData()
 			local filename = generateFilename("resourcedata_" .. data.name, "tsv")
 			local file = ioOpen(filename, "w")
 			if file then
-				file:write("time\twind_speed\tmetal_stored\tenergy_stored\tmetal_income\tenergy_income\tmetal_expense\tenergy_expense\tbuild_power\ttotal_metal_produced\ttotal_energy_produced\tmetal_average\tenergy_average\ttotal_military_value\ttime_weighted_military_avg\n")
+				file:write("time\twind_speed\tmetal_stored\tenergy_stored\tmetal_income\tenergy_income\tmetal_expense\tenergy_expense\tbuild_power\ttotal_metal_produced\ttotal_energy_produced\tmetal_average\tenergy_average\ttotal_army_value\ttime_weighted_army_avg\ttotal_defence_value\ttime_weighted_defence_avg\n")
 				local rd = data.resourceData
 				for i = 1, #rd.seconds do
 					local row = {
 						rd.seconds[i] or 0, format("%.2f", rd.windSpeed[i] or 0), format("%.2f", rd.metalStored[i] or 0), format("%.2f", rd.energyStored[i] or 0), format("%.2f", rd.metalIncome[i] or 0), format("%.2f", rd.energyIncome[i] or 0), format("%.2f", rd.metalExpense[i] or 0), format("%.2f", rd.energyExpense[i] or 0), format("%.2f", rd.buildPower[i] or 0), format("%.2f", rd.totalMetalProduced[i] or 0), format("%.2f", rd.totalEnergyProduced[i] or 0),
-							format("%.2f", rd.metalAverage[i] or 0), format("%.2f", rd.energyAverage[i] or 0), format("%.2f", rd.totalMilitaryValue[i] or 0), format("%.3f", rd.militaryValueIntegrated[i] or 0)}
+							format("%.2f", rd.metalAverage[i] or 0), format("%.2f", rd.energyAverage[i] or 0), format("%.2f", rd.totalArmyValue[i] or 0), format("%.3f", rd.armyValueIntegrated[i] or 0), format("%.2f", rd.totalDefenceValue[i] or 0), format("%.3f", rd.defenceValueIntegrated[i] or 0)}
 					file:write(concat(row, "\t") .. "\n")
 				end
 				file:close()
@@ -206,11 +210,15 @@ function widget:Initialize()
 						totalEnergyProduced = {},
 						metalAverage = {},
 						energyAverage = {},
-						totalMilitaryValue = {},
-						militaryValueIntegrated = {},
+						totalArmyValue = {},
+						armyValueIntegrated = {},
+						totalDefenceValue = {},
+						defenceValueIntegrated = {},
 					},
-					totalMilitaryValue = 0,
-					militaryValueIntegrated = 0,
+					totalArmyValue = 0,
+					armyValueIntegrated = 0,
+					totalDefenceValue = 0,
+					defenceValueIntegrated = 0,
 				}
 			end
 		end
@@ -281,10 +289,13 @@ function widget:Update()
 
 		rd.buildPower[n] = calculateTotalBuildPower(teamID)
 
-		-- Calculate time-average of the cumulative military value curve (shows military production rate weighted by time)
-		rd.totalMilitaryValue[n] = data.totalMilitaryValue
-		data.militaryValueIntegrated = data.militaryValueIntegrated + data.totalMilitaryValue
-		rd.militaryValueIntegrated[n] = gs > 0 and data.militaryValueIntegrated / gs or 0
+		rd.totalArmyValue[n] = data.totalArmyValue
+		data.armyValueIntegrated = data.armyValueIntegrated + data.totalArmyValue
+		rd.armyValueIntegrated[n] = gs > 0 and data.armyValueIntegrated / gs or 0
+
+		rd.totalDefenceValue[n] = data.totalDefenceValue
+		data.defenceValueIntegrated = data.defenceValueIntegrated + data.totalDefenceValue
+		rd.defenceValueIntegrated[n] = gs > 0 and data.defenceValueIntegrated / gs or 0
 	end
 end
 
@@ -319,10 +330,12 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
 		return
 	end
 
-	-- Track military value for resource data
+	-- Track army and defence value for resource data
 	if playerData[unitTeam] then
-		if isArmedUnit(unitDef) then
-			playerData[unitTeam].totalMilitaryValue = playerData[unitTeam].totalMilitaryValue + unitDef.metalCost
+		if isArmyUnit(unitDef) then
+			playerData[unitTeam].totalArmyValue = playerData[unitTeam].totalArmyValue + unitDef.metalCost
+		elseif isDefenceUnit(unitDef) then
+			playerData[unitTeam].totalDefenceValue = playerData[unitTeam].totalDefenceValue + unitDef.metalCost
 		end
 	end
 
