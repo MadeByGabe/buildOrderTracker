@@ -30,6 +30,7 @@ local spEcho = Spring.Echo
 
 -- Localized Lua stdlib
 local floor = math.floor
+local min = math.min
 local format = string.format
 local concat = table.concat
 local ioOpen = io.open
@@ -58,6 +59,9 @@ local buttonX1 = 0
 local buttonY1 = 0
 local buttonX2 = 0
 local buttonY2 = 0
+
+local RECENT_ROW_HEIGHT = 18
+local RECENT_PADDING = 4
 
 local mexNames = {
 	armmex = true,
@@ -374,6 +378,26 @@ end
 
 
 function widget:DrawScreen()
+	-- Recent builds panel above the export button
+	local myData = playerData[myTeamID]
+	if myData and #myData.buildEvents > 0 then
+		local events = myData.buildEvents
+		local numEvents = #events
+		local numToShow = min(3, numEvents)
+		local panelY1 = buttonY2 + 4
+
+		glColor(1, 1, 1, 1)
+		for i = 0, numToShow - 1 do
+			local idx = numEvents - i
+			local event = events[idx]
+			local duration = event.buildDuration and format("%.2f", event.buildDuration) or "?"
+			local gap = idx > 1 and " (" .. format("%.2f", event.buildTime - events[idx - 1].buildTime) .. ")" or ""
+			local textY = panelY1 + RECENT_PADDING + (numToShow - 1 - i) * RECENT_ROW_HEIGHT
+			glText(duration .. gap, buttonX1 + 5, textY, 10, "o")
+		end
+	end
+
+	-- Export button
 	if drawElement then
 		drawElement(buttonX1, buttonY1, buttonX2, buttonY2, 0.8, 0.8, 0.8, 0.8, 1, 1, 1, 1)
 	end
