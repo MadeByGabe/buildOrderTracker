@@ -26,6 +26,9 @@ local spGetUnitDefID = Spring.GetUnitDefID
 local spGetUnitCommands = Spring.GetUnitCommands
 local spGetUnitIsBeingBuilt = Spring.GetUnitIsBeingBuilt
 local spGetUnitMetalExtraction = Spring.GetUnitMetalExtraction
+local spGetUnitWorkerTask = Spring.GetUnitWorkerTask
+local spGetUnitTeam = Spring.GetUnitTeam
+local spValidUnitID = Spring.ValidUnitID
 local spEcho = Spring.Echo
 
 -- Localized Lua stdlib
@@ -50,6 +53,8 @@ local gameStartTimestamp = os.date("%Y%m%d_%H%M%S")
 local isSpectating = false
 local playerData = {}
 local buildStartTimes = {} -- unitID -> game seconds when construction began
+local reclaimTracking = {} -- target unitID -> reclaim start time and reclaimer info
+local RECLAIM_STALE_SECONDS = 1.5 -- reclaim considered abandoned if no builder seen working on it for this long
 local lastGameUpdate = -1
 local exportDirCreated = false
 local drawElement -- cached in Initialize from WG.FlowUI.Draw.Element
@@ -121,6 +126,44 @@ local function calculateTotalBuildPower(teamID)
 end
 
 
+-- Widgets (LuaUI) don't receive reclaim callins like UnitReverseBuilt (synced only),
+-- so we poll each builder's current worker task. When a tracked builder is reclaiming a
+-- completed unit that belongs to a tracked team, we record when the reclaim was first
+-- seen (its start) and keep the "last seen" timestamp fresh while it continues.
+-- UnitDestroyed then turns a tracked-and-still-active reclaim into a logged event.
+local function trackActiveReclaims(gameTime)
+	for teamID in pairs(playerData) do
+		local teamUnits = spGetTeamUnits(teamID)
+		for _, unitID in ipairs(teamUnits) do
+			if not spGetUnitIsBeingBuilt(unitID) then
+				local unitDefID = spGetUnitDefID(unitID)
+				local unitDef = unitDefID and UnitDefs[unitDefID]
+				if unitDef and unitDef.buildSpeed and unitDef.buildSpeed > 0 then
+					local taskCmdID, targetID = spGetUnitWorkerTask(unitID)
+					if taskCmdID == CMD_RECLAIM and targetID and spValidUnitID(targetID)
+						and not spGetUnitIsBeingBuilt(targetID) then
+						local targetTeam = spGetUnitTeam(targetID)
+						if targetTeam and playerData[targetTeam] then
+							local tracking = reclaimTracking[targetID]
+							if not tracking or (gameTime - tracking.lastSeen) > RECLAIM_STALE_SECONDS then
+								reclaimTracking[targetID] = {
+									startTime = gameTime,
+									reclaimerName = unitDef.translatedHumanName,
+									reclaimerID = unitID,
+									lastSeen = gameTime,
+								}
+							else
+								tracking.lastSeen = gameTime
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+
 local function isArmyUnit(unitDef)
 	return unitDef.weapons and (#unitDef.weapons > 0) and not unitDef.customParams.iscommander and (unitDef.speed or 0) > 0
 end
@@ -142,7 +185,8 @@ local function exportData()
 			if file then
 				file:write("unit_name\tbuilt_by\ttime\tbuild_duration\n")
 				for _, event in ipairs(data.buildEvents) do
-					local unitNameWithID = event.unitName .. " (" .. (event.unitID or "?") .. ")"
+					local prefix = event.reclaimed and "-" or ""
+					local unitNameWithID = prefix .. event.unitName .. " (" .. (event.unitID or "?") .. ")"
 					local builder = event.builderName or ""
 					local duration = event.buildDuration and format("%.2f", event.buildDuration) or ""
 					file:write(unitNameWithID .. "\t" .. builder .. "\t" .. format("%.2f", event.buildTime) .. "\t" .. duration .. "\n")
@@ -318,8 +362,50 @@ function widget:UnitCreated(unitID, unitDefID, unitTeam, builderID)
 end
 
 
-function widget:UnitDestroyed(unitID, unitDefID, unitTeam)
+function widget:GameFrame(frame)
+	if frame % 6 == 0 then
+		trackActiveReclaims(spGetGameSeconds())
+	end
+end
+
+
+function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerDefID, attackerTeam, weaponDefID)
 	buildStartTimes[unitID] = nil
+
+	local tracking = reclaimTracking[unitID]
+	reclaimTracking[unitID] = nil
+
+	-- Log a reclaim only if a tracked builder was actively reclaiming this unit right up
+	-- until it disappeared (last seen within the stale window). We rely on the observed
+	-- reclaim task rather than the death's weaponDefID, which isn't reliably the engine's
+	-- Reclaimed damage type across game/engine versions.
+	local gameTime = spGetGameSeconds()
+	if not tracking or not playerData[unitTeam] then
+		return
+	end
+	if (gameTime - tracking.lastSeen) > RECLAIM_STALE_SECONDS then
+		return
+	end
+
+	local unitDef = unitDefID and UnitDefs[unitDefID]
+	local unitName = unitDef and unitDef.translatedHumanName or "unknown"
+
+	local reclaimerStr = nil
+	if tracking.reclaimerName then
+		reclaimerStr = tracking.reclaimerName .. " (" .. tracking.reclaimerID .. ")"
+	elseif attackerID and attackerDefID and UnitDefs[attackerDefID] then
+		reclaimerStr = UnitDefs[attackerDefID].translatedHumanName .. " (" .. attackerID .. ")"
+	end
+
+	local events = playerData[unitTeam].buildEvents
+	events[#events + 1] = {
+		unitName = unitName,
+		unitID = unitID,
+		builderName = reclaimerStr,
+		buildTime = gameTime,
+		buildDuration = gameTime - tracking.startTime,
+		reclaimed = true,
+	}
 end
 
 
