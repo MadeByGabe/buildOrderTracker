@@ -10,7 +10,7 @@ A [Beyond All Reason](https://www.beyondallreason.info/) widget that records bui
 - Accumulates total metal and energy produced, plus running averages
 - Tracks total military value (metal cost of finished armed units) and its time-weighted average
 - Appends extraction rate to MEX unit names (e.g. `Metal Extractor:2.40`)
-- Provides an in-game **Export** button to write files at any point during or after the match
+- Provides a `/export_bo` chat command to write files at any point during or after the match
 
 ## Installation
 
@@ -20,11 +20,11 @@ Copy `buildOrderTracker.lua` into your BAR widgets folder:
 Beyond All Reason/data/LuaUI/Widgets/
 ```
 
-Enable the widget in-game via the widgets menu.
+Enable the widget in-game via the widgets menu. The widget only runs while spectating a live game or watching a replay; it removes itself when you are playing.
 
 ## Usage
 
-An **Export** button appears at the right of the screen. Click it to write TSV files to:
+Type `/export_bo` in chat to write TSV files for every player to:
 
 ```
 Beyond All Reason/data/buildordertracker-builds/
@@ -37,7 +37,7 @@ builddata_PlayerName_some_map_name_20260415_183000.tsv
 resourcedata_PlayerName_some_map_name_20260415_183000.tsv
 ```
 
-You can click Export multiple times; each call overwrites the files for that session.
+You can run `/export_bo` multiple times; each call overwrites the files for that session.
 
 ## Output Format
 
