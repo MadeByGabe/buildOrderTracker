@@ -198,6 +198,22 @@ local function isDefenceUnit(unitDef)
 end
 
 
+-- Events are logged when they end (unit finished, reclaim completed); a build order reads in the order things were started. Ties keep their logged order.
+local function eventsByStartTime(buildEvents)
+	local sorted = {}
+	for i, event in ipairs(buildEvents) do
+		sorted[i] = { event = event, index = i }
+	end
+	table.sort(sorted, function(a, b)
+		if a.event.startTime ~= b.event.startTime then
+			return a.event.startTime < b.event.startTime
+		end
+		return a.index < b.index
+	end)
+	return sorted
+end
+
+
 local function exportData(buildName)
 	ensureExportDir()
 	local filesCreated = 0
@@ -209,13 +225,14 @@ local function exportData(buildName)
 			local file = ioOpen(filename, "w")
 			if file then
 				file:write(metadataLine(data, buildName))
-				file:write("unit_name\tbuilt_by\ttime\tbuild_duration\tunit_def\n")
-				for _, event in ipairs(data.buildEvents) do
+				file:write("unit_name\tbuilt_by\tstart_time\tbuild_duration\tunit_def\n")
+				for _, entry in ipairs(eventsByStartTime(data.buildEvents)) do
+					local event = entry.event
 					local prefix = event.reclaimed and "-" or ""
 					local unitNameWithID = prefix .. event.unitName .. " (" .. (event.unitID or "?") .. ")"
 					local builder = event.builderName or ""
-					local duration = event.buildDuration and format("%.2f", event.buildDuration) or ""
-					file:write(unitNameWithID .. "\t" .. builder .. "\t" .. format("%.2f", event.buildTime) .. "\t" .. duration .. "\t" .. (event.unitDefName or "") .. "\n")
+					local duration = event.duration and format("%.2f", event.duration) or ""
+					file:write(unitNameWithID .. "\t" .. builder .. "\t" .. format("%.2f", event.startTime) .. "\t" .. duration .. "\t" .. (event.unitDefName or "") .. "\n")
 				end
 				file:close()
 				filesCreated = filesCreated + 1
@@ -391,8 +408,8 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerD
 		unitDefName = unitDef and unitDef.name,
 		unitID = unitID,
 		builderName = reclaimerStr,
-		buildTime = gameTime,
-		buildDuration = gameTime - tracking.startTime,
+		startTime = tracking.startTime,
+		duration = gameTime - tracking.startTime,
 		reclaimed = true,
 	}
 end
@@ -425,7 +442,6 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
 	local startTime = buildInfo and buildInfo.startTime or nil
 	local builderName = buildInfo and buildInfo.builderName or nil
 	local builderID = buildInfo and buildInfo.builderID or nil
-	local buildDuration = startTime and (gameTime - startTime) or nil
 	buildStartTimes[unitID] = nil
 
 	local builderStr = nil
@@ -442,8 +458,9 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
 			unitDefName = unitDef.name,
 			unitID = unitID,
 			builderName = builderStr,
-			buildTime = gameTime,
-			buildDuration = buildDuration,
+			-- If the start wasn't seen, fall back to the finish time with an unknown duration
+			startTime = startTime or gameTime,
+			duration = startTime and (gameTime - startTime) or nil,
 		}
 	end
 end

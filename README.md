@@ -66,13 +66,13 @@ The column header row follows on the second line.
 
 ### `builddata_*.tsv`
 
-One row per finished unit, plus one per reclaimed unit.
+One row per finished unit, plus one per reclaimed unit, sorted by start time.
 
 | Column | Description |
 |---|---|
 | `unit_name` | Translated unit name followed by unit ID, e.g. `Wind Turbine (1234)`. MEXes include the extraction rate (`Metal Extractor:2.40 (1234)`). Reclaimed units start with `-` (`-Wind Turbine (1234)`) |
 | `built_by` | Builder name and ID; for reclaims, the unit that reclaimed it. Empty if unknown |
-| `time` | Game time when the unit finished, or when the reclaim completed (seconds) |
+| `start_time` | Game time when construction started, or when the reclaim started (seconds). If the start wasn't seen, the time it finished instead |
 | `build_duration` | How long construction took, or how long the reclaim took (seconds). Empty if the start wasn't seen |
 | `unit_def` | Internal unit name (e.g. `armwin`), the same in every game language |
 
