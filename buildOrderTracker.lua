@@ -52,6 +52,7 @@ local buildStartTimes = {} -- unitID -> game seconds when construction began
 local reclaimTracking = {} -- target unitID -> reclaim start time and reclaimer info
 local RECLAIM_STALE_SECONDS = 1.5 -- reclaim considered abandoned if no builder seen working on it for this long
 local exportDirCreated = false
+local gameIDHex -- from the GameID callin; missed if the widget is enabled after the game started, hence the fallbacks in getGameID
 
 -- Per-unitDef lookups, built once
 local builderSpeed = {} -- unitDefID -> buildSpeed, for anything that can build
@@ -100,18 +101,44 @@ local function ensureExportDir()
 end
 
 
--- First line of every export: "#" plus tab-separated key=value pairs, so the files carry their own context (the filename timestamp is when the export was made, not when the game was played)
-local function metadataLine(data)
-	local gameID = Game.gameID or Spring.GetGameRulesParam("GameID") or "?"
+local function getGameID()
+	return gameIDHex or Game.gameID or Spring.GetGameRulesParam("GameID")
+end
+
+
+-- When the game was played, as a unix timestamp. The engine fills the gameID's first 4 bytes with time() on the host at game start (little-endian), and replays carry the original ID. A lobby can override the gameID with a fixed one, so anything that isn't a plausible date is rejected.
+local function gamePlayedTime(gameID)
+	if type(gameID) ~= "string" or not gameID:match("^%x%x%x%x%x%x%x%x") then
+		return nil
+	end
+	local t = 0
+	for i = 4, 1, -1 do
+		t = t * 256 + tonumber(gameID:sub(i * 2 - 1, i * 2), 16)
+	end
+	if t < 1262304000 or t > 4102444800 then -- 2010-01-01 .. 2100-01-01
+		return nil
+	end
+	return t
+end
+
+
+-- First line of every export: "#" plus tab-separated key=value pairs, so the files carry their own context (the filename timestamp is when the widget loaded, not when the game was played)
+local function metadataLine(data, buildName)
+	local gameID = getGameID()
+	local played = gamePlayedTime(gameID)
 	local fields = {
 		"# buildOrderTracker",
 		"version=" .. FORMAT_VERSION,
 		"player=" .. data.name,
 		"map=" .. (Game.mapName or "?"),
 		"game=" .. (Game.gameName or "?") .. " " .. (Game.gameVersion or ""),
-		"gameID=" .. tostring(gameID),
+		"gameID=" .. tostring(gameID or "?"),
+		"played=" .. (played and os.date("%Y-%m-%d %H:%M:%S", played) or "?"),
 		"exported=" .. os.date("%Y-%m-%d %H:%M:%S"),
 	}
+	if buildName ~= "" then
+		fields[#fields + 1] = "name=" .. buildName
+	end
 	return concat(fields, "\t") .. "\n"
 end
 
@@ -171,7 +198,7 @@ local function isDefenceUnit(unitDef)
 end
 
 
-local function exportData()
+local function exportData(buildName)
 	ensureExportDir()
 	local filesCreated = 0
 
@@ -181,7 +208,7 @@ local function exportData()
 			local filename = generateFilename("builddata_" .. data.name, "tsv")
 			local file = ioOpen(filename, "w")
 			if file then
-				file:write(metadataLine(data))
+				file:write(metadataLine(data, buildName))
 				file:write("unit_name\tbuilt_by\ttime\tbuild_duration\tunit_def\n")
 				for _, event in ipairs(data.buildEvents) do
 					local prefix = event.reclaimed and "-" or ""
@@ -202,7 +229,7 @@ local function exportData()
 			local filename = generateFilename("resourcedata_" .. data.name, "tsv")
 			local file = ioOpen(filename, "w")
 			if file then
-				file:write(metadataLine(data))
+				file:write(metadataLine(data, buildName))
 				file:write(concat(RESOURCE_COLUMNS, "\t") .. "\n")
 				local cells = {}
 				for _, row in ipairs(rows) do
@@ -224,9 +251,16 @@ local function exportData()
 end
 
 
-local function exportBuildOrderCmd()
-	exportData()
+-- "/export_bo commander tempo build": the text after the command is saved as the build order's name in the metadata line. Control characters (tabs, newlines) would break the TSV, so they become spaces.
+local function exportBuildOrderCmd(_, optLine)
+	local buildName = (optLine or ""):gsub("%c", " "):match("^%s*(.-)%s*$")
+	exportData(buildName)
 	return true
+end
+
+
+function widget:GameID(gameID)
+	gameIDHex = gameID
 end
 
 
