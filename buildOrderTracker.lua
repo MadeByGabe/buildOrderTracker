@@ -12,7 +12,7 @@ end
 
 
 -- Export format version, written into each file's "#" metadata line
-local FORMAT_VERSION = 2
+local FORMAT_VERSION = 3
 
 -- Localized Spring API
 local spGetSpectatingState = Spring.GetSpectatingState
@@ -51,6 +51,12 @@ local playerData = {}
 local buildStartTimes = {} -- unitID -> game seconds when construction began
 local reclaimTracking = {} -- target unitID -> reclaim start time and reclaimer info
 local RECLAIM_STALE_SECONDS = 1.5 -- reclaim considered abandoned if no builder seen working on it for this long
+local assistTimes = {} -- unitID under construction -> { [assisting builder's unitID] = seconds seen working on it }
+local WORKER_POLL_FRAMES = 6 -- how often builders' worker tasks are polled
+local WORKER_POLL_SECONDS = WORKER_POLL_FRAMES / GAME_SPEED
+-- An assistant that helped for all but this much of a build is written without its seconds (a constant nano turret, a con guarding the factory): the larger of the two
+local ASSIST_FULL_SLACK = 0.6
+local ASSIST_FULL_FRACTION = 0.05
 local exportDirCreated = false
 local gameIDHex -- from the GameID callin; missed if the widget is enabled after the game started, hence the fallbacks in getGameID
 
@@ -163,15 +169,29 @@ local function calculateBuildPowerInUse(teamID)
 end
 
 
--- Widgets (LuaUI) don't receive reclaim callins like UnitReverseBuilt (synced only), so we poll each builder's current worker task. When a tracked builder is reclaiming a completed unit that belongs to a tracked team, we record when the reclaim was first seen (its start) and keep the "last seen" timestamp fresh while it continues. UnitDestroyed then turns a tracked-and-still-active reclaim into a logged event.
-local function trackActiveReclaims(gameTime)
+-- Widgets (LuaUI) don't receive reclaim or assist callins, so we poll each builder's current worker task.
+-- Reclaim: when a tracked builder is reclaiming a completed unit that belongs to a tracked team, we record when the reclaim was first seen (its start) and keep the "last seen" timestamp fresh while it continues. UnitDestroyed then turns a tracked-and-still-active reclaim into a logged event.
+-- Assist: a builder working on a unit under construction that some other unit started (a con guarding the factory, a nano turret, the commander helping a con's mex) is credited one poll interval of help on that unit. UnitFinished writes the tally into the unit's built_by cell.
+local function trackWorkerTasks(gameTime)
 	for teamID in pairs(playerData) do
 		for _, unitID in ipairs(spGetTeamUnits(teamID)) do
 			local unitDefID = spGetUnitDefID(unitID)
 			if builderSpeed[unitDefID] and not spGetUnitIsBeingBuilt(unitID) then
 				local taskCmdID, targetID = spGetUnitWorkerTask(unitID)
+				local targetBeingBuilt = targetID and spValidUnitID(targetID) and spGetUnitIsBeingBuilt(targetID)
+				if taskCmdID and taskCmdID < 0 and targetBeingBuilt then -- build commands are the negative unitDefID; excludes capturing a nanoframe
+					local buildInfo = buildStartTimes[targetID]
+					if buildInfo and buildInfo.builderID ~= unitID then
+						local times = assistTimes[targetID]
+						if not times then
+							times = {}
+							assistTimes[targetID] = times
+						end
+						times[unitID] = (times[unitID] or 0) + WORKER_POLL_SECONDS
+					end
+				end
 				if taskCmdID == CMD_RECLAIM and targetID and spValidUnitID(targetID)
-					and not spGetUnitIsBeingBuilt(targetID) then
+					and not targetBeingBuilt then
 					local targetTeam = spGetUnitTeam(targetID)
 					if targetTeam and playerData[targetTeam] then
 						local tracking = reclaimTracking[targetID]
@@ -202,6 +222,33 @@ local function isDefenceUnit(unitDef)
 end
 
 
+-- The assistants of a finished unit, as the suffix of its built_by cell: "11501,27409=2.1" — a builder's unitID, with the seconds it helped unless it helped (nearly) the whole build. nil when nobody assisted.
+local function assistCell(times, duration)
+	if not times then
+		return nil
+	end
+	local ids = {}
+	for builderID in pairs(times) do
+		ids[#ids + 1] = builderID
+	end
+	if #ids == 0 then
+		return nil
+	end
+	table.sort(ids)
+	local slack = duration and math.max(ASSIST_FULL_SLACK, ASSIST_FULL_FRACTION * duration)
+	local cells = {}
+	for i, builderID in ipairs(ids) do
+		local seconds = times[builderID]
+		if slack and seconds >= duration - slack then
+			cells[i] = tostring(builderID)
+		else
+			cells[i] = builderID .. "=" .. format("%.1f", seconds)
+		end
+	end
+	return concat(cells, ",")
+end
+
+
 -- Events are logged when they end (unit finished, reclaim completed); a build order reads in the order things were started. Ties keep their logged order.
 local function eventsByStartTime(buildEvents)
 	local sorted = {}
@@ -223,7 +270,7 @@ local function exportData(buildName)
 	local filesCreated = 0
 
 	for teamID, data in pairs(playerData) do
-		-- Export build events. unit_name/built_by are the (translated) display names; unit_def is the internal name, which matches in any game language
+		-- Export build events. unit_name/built_by are the (translated) display names; unit_def is the internal name, which matches in any game language. built_by carries the unit's assistants after a ":" (see assistCell): "Bot Lab (2436):11501,27409=2.1"
 		if #data.buildEvents > 0 then
 			local filename = generateFilename("builddata_" .. data.name, "tsv")
 			local file = ioOpen(filename, "w")
@@ -372,8 +419,8 @@ end
 
 
 function widget:GameFrame(frame)
-	if frame % 6 == 0 then
-		trackActiveReclaims(spGetGameSeconds())
+	if frame % WORKER_POLL_FRAMES == 0 then
+		trackWorkerTasks(spGetGameSeconds())
 	end
 	if frame % GAME_SPEED == 1 then
 		sampleSecond(floor(frame / GAME_SPEED))
@@ -383,6 +430,7 @@ end
 
 function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerDefID, attackerTeam, weaponDefID)
 	buildStartTimes[unitID] = nil
+	assistTimes[unitID] = nil
 
 	local tracking = reclaimTracking[unitID]
 	reclaimTracking[unitID] = nil
@@ -454,6 +502,12 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
 	elseif builderName then
 		builderStr = builderName
 	end
+	local duration = startTime and (gameTime - startTime) or nil
+	local assists = assistCell(assistTimes[unitID], duration)
+	assistTimes[unitID] = nil
+	if builderStr and assists then
+		builderStr = builderStr .. ":" .. assists
+	end
 
 	if playerData[unitTeam] then
 		local events = playerData[unitTeam].buildEvents
@@ -464,7 +518,7 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
 			builderName = builderStr,
 			-- If the start wasn't seen, fall back to the finish time with an unknown duration
 			startTime = startTime or gameTime,
-			duration = startTime and (gameTime - startTime) or nil,
+			duration = duration,
 		}
 	end
 end

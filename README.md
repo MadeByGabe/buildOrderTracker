@@ -5,6 +5,7 @@ A [Beyond All Reason](https://www.beyondallreason.info/) widget that records bui
 ## Features
 
 - Tracks every unit completion: what was built, which builder built it, when, and how long construction took
+- Tracks which other builders assisted each build (guarding cons, nano turrets, the commander helping), and for how long
 - Tracks when players reclaim their own finished units (e.g. wind turbines, to make room), with the reclaimer and how long it took
 - Records per-second snapshots of metal/energy income, expense, pull, excess, storage, and transfers between allies
 - Tracks the build power actually in use (idle or stalled builders don't count)
@@ -60,6 +61,8 @@ The first line of every file starts with `#` and holds tab-separated `key=value`
 | `gameID` | Engine game ID |
 | `played` | When the game started (local time), decoded from the game ID; `?` if unavailable |
 | `exported` | When the export was made (local time) |
+| `windMin`, `windMax` | The map's wind speed range; `?` if unavailable |
+| `tidal` | The map's tidal strength; `?` if unavailable |
 | `name` | Build order name given after `/export_bo`; omitted when there is none |
 
 The column header row follows on the second line.
@@ -71,10 +74,23 @@ One row per finished unit, plus one per reclaimed unit, sorted by start time.
 | Column | Description |
 |---|---|
 | `unit_name` | Translated unit name followed by unit ID, e.g. `Wind Turbine (1234)`. MEXes include the extraction rate (`Metal Extractor:2.40 (1234)`). Reclaimed units start with `-` (`-Wind Turbine (1234)`) |
-| `built_by` | Builder name and ID; for reclaims, the unit that reclaimed it. Empty if unknown |
+| `built_by` | Builder name and ID; for reclaims, the unit that reclaimed it. Empty if unknown. Assistants follow after a `:` (see below) |
 | `start_time` | Game time when construction started, or when the reclaim started (seconds). If the start wasn't seen, the time it finished instead |
 | `build_duration` | How long construction took, or how long the reclaim took (seconds). Empty if the start wasn't seen |
 | `unit_def` | Internal unit name (e.g. `armwin`), the same in every game language |
+
+#### Assistants
+
+When other builders helped construct a unit, `built_by` lists their unit IDs after a `:`, comma-separated and sorted by ID:
+
+```
+Bot Lab (2436):11501,27409=2.1
+```
+
+- `11501` helped for the whole build (within 0.6 seconds or 5% of the build duration, whichever is larger), so no time is written
+- `27409=2.1` helped for 2.1 seconds of it
+
+The builder that started the unit is never listed as its own assistant. Time is sampled every 0.2 seconds, so short assists are approximate. It is time spent helping, not build power: multiply by the assistant's build speed to estimate its contribution. Reclaims have no assistants, and neither do units whose start wasn't seen. To split the cell, split on the first `):`.
 
 ### `resourcedata_*.tsv`
 
