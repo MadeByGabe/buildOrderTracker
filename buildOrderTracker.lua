@@ -135,6 +135,10 @@ local function metadataLine(data, buildName)
 		"gameID=" .. tostring(gameID or "?"),
 		"played=" .. (played and os.date("%Y-%m-%d %H:%M:%S", played) or "?"),
 		"exported=" .. os.date("%Y-%m-%d %H:%M:%S"),
+		-- the map's wind range and tidal strength, so a simulation of this build can run under the same conditions
+		"windMin=" .. (Game.windMin and format("%.2f", Game.windMin) or "?"),
+		"windMax=" .. (Game.windMax and format("%.2f", Game.windMax) or "?"),
+		"tidal=" .. (Game.tidal and format("%.2f", Game.tidal) or "?"),
 	}
 	if buildName ~= "" then
 		fields[#fields + 1] = "name=" .. buildName
