@@ -23,13 +23,19 @@ Copy `buildOrderTracker.lua` into your BAR widgets folder:
 Beyond All Reason/data/LuaUI/Widgets/
 ```
 
-Enable the widget in-game via the widgets menu. The widget only runs while spectating a live game or watching a replay; it removes itself when you are playing.
+Enable the widget in-game via the widgets menu. It runs in three cases:
+
+- spectating a live game: every player is tracked
+- watching a replay: every player is tracked
+- playing a practice game against an inactive AI: only your own team is tracked
+
+While playing, a client may only read its own team's resources, so the widget removes itself in a real match. A practice game means nobody else is playing (other humans may spectate) and every other team is a skirmish AI that does nothing — the engine's `NullAI`, listed in the lobby as *Test AI using the new C interface* ("This AI does absolutely nothing"). A real AI (BARb, CircuitAI) or a Lua AI (Scavengers, Raptors, the Simple AIs) keeps the widget off; the chat message says which team disqualified the game.
 
 Enable it before the game starts (or before starting the replay): it only records from the moment it is enabled, and the date the game was played is only available at game start.
 
 ## Usage
 
-Type `/export_bo` in chat to write TSV files for every player to:
+Type `/export_bo` in chat to write TSV files for every tracked player to:
 
 ```
 Beyond All Reason/data/buildordertracker-builds/

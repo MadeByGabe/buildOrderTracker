@@ -1,7 +1,7 @@
 function widget:GetInfo()
 	return {
 		name = "BuildOrderTracker",
-		desc = "Tracks build events and resource data per second to help analyze build order efficiency. Spectators and replays only; /export_bo writes the files.",
+		desc = "Tracks build events and resource data per second to help analyze build order efficiency. Spectating, replays, and practice games against an inactive AI; /export_bo writes the files.",
 		author = "Baldric",
 		date = "2026-09-19",
 		license = "GNU GPL, v2 or later",
@@ -20,6 +20,12 @@ local spIsReplay = Spring.IsReplay
 local spGetPlayerInfo = Spring.GetPlayerInfo
 local spGetPlayerList = Spring.GetPlayerList
 local spGetGaiaTeamID = Spring.GetGaiaTeamID
+local spGetMyPlayerID = Spring.GetMyPlayerID
+local spGetMyTeamID = Spring.GetMyTeamID
+local spGetTeamList = Spring.GetTeamList
+local spGetTeamInfo = Spring.GetTeamInfo
+local spGetTeamLuaAI = Spring.GetTeamLuaAI
+local spGetAIInfo = Spring.GetAIInfo
 local spGetGameSeconds = Spring.GetGameSeconds
 local spGetWind = Spring.GetWind
 local spGetTeamResources = Spring.GetTeamResources
@@ -332,28 +338,84 @@ function widget:GameID(gameID)
 end
 
 
-function widget:Initialize()
-	-- Only useful when observing: spectating a live game or watching a replay
-	if not (spIsReplay() or spGetSpectatingState()) then
-		widgetHandler:RemoveWidget()
-		return
+-- Skirmish AIs that never issue an order, by their shortName: practising a build order against one of these is the same as practising on an empty map. NullAI ships with the engine and describes itself as "This AI does absolutely nothing".
+local INACTIVE_AI_SHORTNAMES = {
+	NullAI = true,
+}
+
+
+-- Tracking a team means reading its resources, which a *playing* client may only do for its own team, so in a real match the widget would be both blind and suspect. A practice game is an exception.
+---@return boolean practice
+---@return string? reason what disqualified the game, when it isn't a practice game
+local function isPracticeGame()
+	local myPlayerID = spGetMyPlayerID()
+	for _, playerID in ipairs(spGetPlayerList()) do
+		if playerID ~= myPlayerID then
+			local pName, _, pSpectator = spGetPlayerInfo(playerID, false)
+			if not pSpectator then
+				return false, (pName or "player " .. playerID) .. " is playing too"
+			end
+		end
 	end
 
+	local myTeamID = spGetMyTeamID()
 	local gaiaTeamID = spGetGaiaTeamID()
-	local allPlayers = spGetPlayerList()
-	for _, playerID in ipairs(allPlayers) do
-		local pName, pActive, pSpectator, pTeamID = spGetPlayerInfo(playerID)
-		if not pSpectator and pTeamID ~= gaiaTeamID then
-			playerData[pTeamID] = {
-				name = (pName or "player" .. playerID):gsub("[^%w_%-]", "_"),
-				buildEvents = {},
-				resourceRows = {},
-				totalMetalProduced = 0,
-				totalEnergyProduced = 0,
-				armyValueBuilt = 0,
-				defenceValueBuilt = 0,
-			}
+	for _, teamID in ipairs(spGetTeamList()) do
+		if teamID ~= myTeamID and teamID ~= gaiaTeamID then
+			local luaAI = spGetTeamLuaAI(teamID)
+			if luaAI and luaAI ~= "" then
+				return false, "team " .. teamID .. " is run by " .. luaAI
+			end
+			local _, _, _, hasAI = spGetTeamInfo(teamID, false)
+			if not hasAI then
+				return false, "team " .. teamID .. " is not an AI"
+			end
+			-- Unsynced, so this is the real shortName; an AI hosted by someone else can read back as "UNKNOWN", which counts as active
+			local _, _, _, shortName = spGetAIInfo(teamID)
+			if not INACTIVE_AI_SHORTNAMES[shortName] then
+				return false, "team " .. teamID .. " is run by " .. tostring(shortName) .. ", which plays"
+			end
 		end
+	end
+
+	return true
+end
+
+
+local function trackTeam(teamID, name)
+	playerData[teamID] = {
+		name = (name or "team" .. teamID):gsub("[^%w_%-]", "_"),
+		buildEvents = {},
+		resourceRows = {},
+		totalMetalProduced = 0,
+		totalEnergyProduced = 0,
+		armyValueBuilt = 0,
+		defenceValueBuilt = 0,
+	}
+end
+
+
+function widget:Initialize()
+	if spIsReplay() or spGetSpectatingState() then
+		-- Observing: every player's data is readable, so track all of them
+		local gaiaTeamID = spGetGaiaTeamID()
+		for _, playerID in ipairs(spGetPlayerList()) do
+			local pName, _, pSpectator, pTeamID = spGetPlayerInfo(playerID, false)
+			if not pSpectator and pTeamID ~= gaiaTeamID then
+				trackTeam(pTeamID, pName or "player" .. playerID)
+			end
+		end
+	else
+		local practice, reason = isPracticeGame()
+		if not practice then
+			spEcho("BuildOrderTracker: removed. While playing it only runs in a practice game against an inactive AI (" .. (reason or "?") .. "). Spectate or watch a replay to track every player.")
+			widgetHandler:RemoveWidget()
+			return
+		end
+		local myPlayerID = spGetMyPlayerID()
+		local myTeamID = spGetMyTeamID()
+		trackTeam(myTeamID, (spGetPlayerInfo(myPlayerID, false)) or "player" .. myPlayerID)
+		spEcho("BuildOrderTracker: practice game, tracking your own team (" .. playerData[myTeamID].name .. ")")
 	end
 
 	widgetHandler:AddAction("export_bo", exportBuildOrderCmd, nil, "t")
