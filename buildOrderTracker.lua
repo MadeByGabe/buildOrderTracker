@@ -12,7 +12,7 @@ end
 
 
 -- Export format version, written into each file's "#" metadata line
-local FORMAT_VERSION = 4
+local FORMAT_VERSION = 5
 
 -- Localized Spring API
 local spGetSpectatingState = Spring.GetSpectatingState
@@ -123,6 +123,11 @@ local RESOURCE_COLUMNS = {
 	"total_metal_reclaimed", "total_energy_reclaimed",
 	-- Energy converters: what the team could convert per second, and what it did convert
 	"converter_capacity", "converter_use",
+}
+
+-- Build data columns, in export order. unit_name/built_by are the translated display names; unit_def is the internal one, which matches in any game language. built_by carries the unit's assistants after a ":" (see assistCell): "Bot Lab (2436):11501,27409=2.1"
+local BUILD_COLUMNS = {
+	"unit_name", "built_by", "start_time", "build_duration", "unit_def",
 }
 
 -- Reclaim data columns, in export order: one row per reclaiming unit per source, and only for a second in which something was reclaimed. See writeReclaimRows.
@@ -343,69 +348,67 @@ local function eventsByStartTime(buildEvents)
 end
 
 
+-- The three kinds of data are three different shapes - one row per unit event, one per game second, one per second per reclaiming unit - so they are written as three blocks of one file rather than joined into a table none of them fits. A block opens with a blank line, a "## <name>" marker and its own header row, which is all a reader needs to split the file back into three tables; the metadata line at the top then covers all three at once.
+local function beginSection(file, name, columns)
+	file:write("\n## " .. name .. "\n" .. concat(columns, "\t") .. "\n")
+end
+
+
+-- Events are written in the order they were started (see eventsByStartTime), which is how a build order reads.
+local function writeBuildSection(file, events)
+	beginSection(file, "build", BUILD_COLUMNS)
+	for _, entry in ipairs(eventsByStartTime(events)) do
+		local event = entry.event
+		local prefix = event.reclaimed and "-" or ""
+		local unitNameWithID = prefix .. event.unitName .. " (" .. (event.unitID or "?") .. ")"
+		local builder = event.builderName or ""
+		local duration = event.duration and format("%.2f", event.duration) or ""
+		file:write(unitNameWithID .. "\t" .. builder .. "\t" .. format("%.2f", event.startTime) .. "\t" .. duration .. "\t" .. (event.unitDefName or "") .. "\n")
+	end
+end
+
+
+local function writeResourceSection(file, rows)
+	beginSection(file, "resource", RESOURCE_COLUMNS)
+	local cells = {}
+	for _, row in ipairs(rows) do
+		cells[1] = format("%d", row[1])
+		for i = 2, #RESOURCE_COLUMNS do
+			cells[i] = format("%.2f", row[i] or 0)
+		end
+		file:write(concat(cells, "\t") .. "\n")
+	end
+end
+
+
+-- See writeReclaimRows. reclaimer_id joins to the builder's unitID in the build block, so a reclaimer can be followed back to when and by what it was built.
+local function writeReclaimSection(file, rows)
+	beginSection(file, "reclaim", RECLAIM_COLUMNS)
+	for _, row in ipairs(rows) do
+		file:write(format("%d\t%d\t%s\t%s\t%s\t%.2f\t%.2f\n",
+			row[1], row[2], row[3], row[4], row[5], row[6], row[7]))
+	end
+end
+
+
+-- One file per tracked player. All three blocks are written even when a block has no rows - a game where nothing was reclaimed still gets an empty reclaim block - so every file has the same shape and a reader never has to tell a missing block from an empty one.
 local function exportData(buildName)
 	ensureExportDir()
 	local filesCreated = 0
 
-	for teamID, data in pairs(playerData) do
-		-- Export build events. unit_name/built_by are the (translated) display names; unit_def is the internal name, which matches in any game language. built_by carries the unit's assistants after a ":" (see assistCell): "Bot Lab (2436):11501,27409=2.1"
-		if #data.buildEvents > 0 then
-			local filename = generateFilename("builddata_" .. data.name, "tsv")
+	for _, data in pairs(playerData) do
+		if #data.buildEvents > 0 or #data.resourceRows > 0 then
+			local filename = generateFilename("buildorder_" .. data.name, "tsv")
 			local file = ioOpen(filename, "w")
 			if file then
 				file:write(metadataLine(data, buildName))
-				file:write("unit_name\tbuilt_by\tstart_time\tbuild_duration\tunit_def\n")
-				for _, entry in ipairs(eventsByStartTime(data.buildEvents)) do
-					local event = entry.event
-					local prefix = event.reclaimed and "-" or ""
-					local unitNameWithID = prefix .. event.unitName .. " (" .. (event.unitID or "?") .. ")"
-					local builder = event.builderName or ""
-					local duration = event.duration and format("%.2f", event.duration) or ""
-					file:write(unitNameWithID .. "\t" .. builder .. "\t" .. format("%.2f", event.startTime) .. "\t" .. duration .. "\t" .. (event.unitDefName or "") .. "\n")
-				end
+				writeBuildSection(file, data.buildEvents)
+				writeResourceSection(file, data.resourceRows)
+				writeReclaimSection(file, data.reclaimRows)
 				file:close()
 				filesCreated = filesCreated + 1
-				spEcho("BuildOrderTracker: Exported " .. #data.buildEvents .. " build events for " .. data.name)
-			end
-		end
-
-		-- Export resource data
-		local rows = data.resourceRows
-		if #rows > 0 then
-			local filename = generateFilename("resourcedata_" .. data.name, "tsv")
-			local file = ioOpen(filename, "w")
-			if file then
-				file:write(metadataLine(data, buildName))
-				file:write(concat(RESOURCE_COLUMNS, "\t") .. "\n")
-				local cells = {}
-				for _, row in ipairs(rows) do
-					cells[1] = format("%d", row[1])
-					for i = 2, #RESOURCE_COLUMNS do
-						cells[i] = format("%.2f", row[i] or 0)
-					end
-					file:write(concat(cells, "\t") .. "\n")
-				end
-				file:close()
-				filesCreated = filesCreated + 1
-				spEcho("BuildOrderTracker: Exported " .. #rows .. " data points for " .. data.name)
-			end
-		end
-
-		-- Export per-second reclaim (see writeReclaimRows). reclaimer_id joins to the builder's unitID in the build data, so a reclaimer can be followed back to when and by what it was built.
-		local reclaims = data.reclaimRows
-		if #reclaims > 0 then
-			local filename = generateFilename("reclaimdata_" .. data.name, "tsv")
-			local file = ioOpen(filename, "w")
-			if file then
-				file:write(metadataLine(data, buildName))
-				file:write(concat(RECLAIM_COLUMNS, "\t") .. "\n")
-				for _, row in ipairs(reclaims) do
-					file:write(format("%d\t%d\t%s\t%s\t%s\t%.2f\t%.2f\n",
-						row[1], row[2], row[3], row[4], row[5], row[6], row[7]))
-				end
-				file:close()
-				filesCreated = filesCreated + 1
-				spEcho("BuildOrderTracker: Exported " .. #reclaims .. " reclaim rows for " .. data.name)
+				spEcho("BuildOrderTracker: Exported " .. data.name .. " - " .. #data.buildEvents .. " build events, "
+					.. #data.resourceRows .. " data points, " .. #data.reclaimRows .. " reclaim rows")
 			end
 		end
 	end
