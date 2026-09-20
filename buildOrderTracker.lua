@@ -3,7 +3,7 @@ function widget:GetInfo()
 		name = "BuildOrderTracker",
 		desc = "Tracks build events and resource data per second to help analyze build order efficiency. Spectating, replays, and practice games against an inactive AI; /export_bo writes the files.",
 		author = "Baldric",
-		date = "2026-09-19",
+		date = "2026-09-20",
 		license = "GNU GPL, v2 or later",
 		layer = 100,
 		enabled = false,
@@ -12,7 +12,7 @@ end
 
 
 -- Export format version, written into each file's "#" metadata line
-local FORMAT_VERSION = 3
+local FORMAT_VERSION = 4
 
 -- Localized Spring API
 local spGetSpectatingState = Spring.GetSpectatingState
@@ -29,6 +29,7 @@ local spGetAIInfo = Spring.GetAIInfo
 local spGetGameSeconds = Spring.GetGameSeconds
 local spGetWind = Spring.GetWind
 local spGetTeamResources = Spring.GetTeamResources
+local spGetTeamRulesParam = Spring.GetTeamRulesParam
 local spGetTeamUnits = Spring.GetTeamUnits
 local spGetUnitDefID = Spring.GetUnitDefID
 local spGetUnitIsBeingBuilt = Spring.GetUnitIsBeingBuilt
@@ -37,10 +38,13 @@ local spGetUnitMetalExtraction = Spring.GetUnitMetalExtraction
 local spGetUnitWorkerTask = Spring.GetUnitWorkerTask
 local spGetUnitTeam = Spring.GetUnitTeam
 local spValidUnitID = Spring.ValidUnitID
+local spValidFeatureID = Spring.ValidFeatureID
+local spGetFeatureDefID = Spring.GetFeatureDefID
 local spEcho = Spring.Echo
 
 -- Localized Lua stdlib
 local floor = math.floor
+local max = math.max
 local format = string.format
 local concat = table.concat
 local ioOpen = io.open
@@ -51,6 +55,19 @@ local ipairs = ipairs
 local CMD_RECLAIM = CMD.RECLAIM
 
 local GAME_SPEED = Game.gameSpeed or 30
+local MAX_UNITS = Game.maxUnits or 32000
+
+-- The engine's named causes of death: the ones that can mean a builder took the unit apart (it
+-- reclaimed it, or a gadget removed it) against the rest, which rule a reclaim out. A death the
+-- engine names no cause for leaves the question open.
+local RECLAIM_CAUSE, OTHER_CAUSE = {}, {}
+for name, id in pairs(Game.envDamageTypes or {}) do
+	if name == "Reclaimed" or name == "KilledByLua" then
+		RECLAIM_CAUSE[id] = true
+	else
+		OTHER_CAUSE[id] = true
+	end
+end
 
 local gameStartTimestamp = os.date("%Y%m%d_%H%M%S")
 local playerData = {}
@@ -63,6 +80,8 @@ local WORKER_POLL_SECONDS = WORKER_POLL_FRAMES / GAME_SPEED
 -- An assistant that helped for all but this much of a build is written without its seconds (a constant nano turret, a con guarding the factory): the larger of the two
 local ASSIST_FULL_SLACK = 0.6
 local ASSIST_FULL_FRACTION = 0.05
+-- [teamID][reclaimerID] = { weight, wreckWeight, name, defName }: the builders seen reclaiming a feature since the last sample, each weighed by the build power it had in use. Cleared by writeReclaimRows, which splits the second's take over them.
+local reclaimSeen = {}
 local exportDirCreated = false
 local gameIDHex -- from the GameID callin; missed if the widget is enabled after the game started, hence the fallbacks in getGameID
 
@@ -75,6 +94,14 @@ for unitDefID, unitDef in pairs(UnitDefs) do
 	end
 	if (unitDef.extractsMetal or 0) > 0 then
 		isMex[unitDefID] = true
+	end
+end
+
+-- featureDefID -> true for a unit's corpse: the game stamps every featureDef it makes from a unit with the unit it came from. What the map itself put down - trees, rocks - carries no such stamp.
+local isWreckDef = {}
+for featureDefID, featureDef in pairs(FeatureDefs) do
+	if featureDef.customParams and featureDef.customParams.fromunit then
+		isWreckDef[featureDefID] = true
 	end
 end
 
@@ -92,6 +119,15 @@ local RESOURCE_COLUMNS = {
 	"total_metal_produced", "total_energy_produced",
 	"metal_average", "energy_average",
 	"army_value_built", "defence_value_built",
+	-- What this team's builders took from features (wrecks, rocks, trees), as running totals. Part of metal_income/energy_income rather than on top of them, and zero throughout without the team stats gadget to count it (see writeReclaimRows).
+	"total_metal_reclaimed", "total_energy_reclaimed",
+	-- Energy converters: what the team could convert per second, and what it did convert
+	"converter_capacity", "converter_use",
+}
+
+-- Reclaim data columns, in export order: one row per reclaiming unit per source, and only for a second in which something was reclaimed. See writeReclaimRows.
+local RECLAIM_COLUMNS = {
+	"time", "reclaimer_id", "reclaimer", "reclaimer_def", "source", "metal", "energy",
 }
 
 local function generateFilename(prefix, extension)
@@ -175,8 +211,22 @@ local function calculateBuildPowerInUse(teamID)
 end
 
 
+-- A worker task's target as a feature, or nil when it is a unit. Older engines offset a feature's ID by Game.maxUnits and newer ones don't (Engine.FeatureSupport.noOffsetForFeatureID), so it is resolved the way the game's own gadgets resolve it: above the unit range only a feature fits, below it a unit wins - which on a newer engine reads a low-numbered feature as the unit of that ID, an ambiguity the game itself lives with.
+local function workerTaskFeature(targetID)
+	if targetID >= MAX_UNITS then
+		local featureID = targetID - MAX_UNITS
+		return spValidFeatureID(featureID) and featureID or nil
+	end
+	if spValidUnitID(targetID) then
+		return nil
+	end
+	return spValidFeatureID(targetID) and targetID or nil
+end
+
+
 -- Widgets (LuaUI) don't receive reclaim or assist callins, so we poll each builder's current worker task.
 -- Reclaim: when a tracked builder is reclaiming a completed unit that belongs to a tracked team, we record when the reclaim was first seen (its start) and keep the "last seen" timestamp fresh while it continues. UnitDestroyed then turns a tracked-and-still-active reclaim into a logged event.
+-- Feature reclaim: a builder taking a wreck, rock or tree apart is weighed by the build power it has in use, for the per-second split in writeReclaimRows.
 -- Assist: a builder working on a unit under construction that some other unit started (a con guarding the factory, a nano turret, the commander helping a con's mex) is credited one poll interval of help on that unit. UnitFinished writes the tally into the unit's built_by cell.
 local function trackWorkerTasks(gameTime)
 	for teamID in pairs(playerData) do
@@ -196,20 +246,42 @@ local function trackWorkerTasks(gameTime)
 						times[unitID] = (times[unitID] or 0) + WORKER_POLL_SECONDS
 					end
 				end
-				if taskCmdID == CMD_RECLAIM and targetID and spValidUnitID(targetID)
-					and not targetBeingBuilt then
-					local targetTeam = spGetUnitTeam(targetID)
-					if targetTeam and playerData[targetTeam] then
-						local tracking = reclaimTracking[targetID]
-						if not tracking or (gameTime - tracking.lastSeen) > RECLAIM_STALE_SECONDS then
-							reclaimTracking[targetID] = {
-								startTime = gameTime,
-								reclaimerName = UnitDefs[unitDefID].translatedHumanName,
-								reclaimerID = unitID,
-								lastSeen = gameTime,
-							}
-						else
-							tracking.lastSeen = gameTime
+				if taskCmdID == CMD_RECLAIM and targetID then
+					local featureID = workerTaskFeature(targetID)
+					if featureID then
+						-- A builder still walking to its target applies no build power and is credited nothing; two on the same feature share it as the engine does.
+						local weight = builderSpeed[unitDefID] * (spGetUnitCurrentBuildPower(unitID) or 0)
+						if weight > 0 then
+							local seen = reclaimSeen[teamID]
+							local entry = seen[unitID]
+							if not entry then
+								entry = {
+									weight = 0,
+									wreckWeight = 0,
+									name = UnitDefs[unitDefID].translatedHumanName,
+									defName = UnitDefs[unitDefID].name,
+								}
+								seen[unitID] = entry
+							end
+							entry.weight = entry.weight + weight
+							if isWreckDef[spGetFeatureDefID(featureID)] then
+								entry.wreckWeight = entry.wreckWeight + weight
+							end
+						end
+					elseif spValidUnitID(targetID) and not targetBeingBuilt then
+						local targetTeam = spGetUnitTeam(targetID)
+						if targetTeam and playerData[targetTeam] then
+							local tracking = reclaimTracking[targetID]
+							if not tracking or (gameTime - tracking.lastSeen) > RECLAIM_STALE_SECONDS then
+								reclaimTracking[targetID] = {
+									startTime = gameTime,
+									reclaimerName = UnitDefs[unitDefID].translatedHumanName,
+									reclaimerID = unitID,
+									lastSeen = gameTime,
+								}
+							else
+								tracking.lastSeen = gameTime
+							end
 						end
 					end
 				end
@@ -241,7 +313,7 @@ local function assistCell(times, duration)
 		return nil
 	end
 	table.sort(ids)
-	local slack = duration and math.max(ASSIST_FULL_SLACK, ASSIST_FULL_FRACTION * duration)
+	local slack = duration and max(ASSIST_FULL_SLACK, ASSIST_FULL_FRACTION * duration)
 	local cells = {}
 	for i, builderID in ipairs(ids) do
 		local seconds = times[builderID]
@@ -318,6 +390,24 @@ local function exportData(buildName)
 				spEcho("BuildOrderTracker: Exported " .. #rows .. " data points for " .. data.name)
 			end
 		end
+
+		-- Export per-second reclaim (see writeReclaimRows). reclaimer_id joins to the builder's unitID in the build data, so a reclaimer can be followed back to when and by what it was built.
+		local reclaims = data.reclaimRows
+		if #reclaims > 0 then
+			local filename = generateFilename("reclaimdata_" .. data.name, "tsv")
+			local file = ioOpen(filename, "w")
+			if file then
+				file:write(metadataLine(data, buildName))
+				file:write(concat(RECLAIM_COLUMNS, "\t") .. "\n")
+				for _, row in ipairs(reclaims) do
+					file:write(format("%d\t%d\t%s\t%s\t%s\t%.2f\t%.2f\n",
+						row[1], row[2], row[3], row[4], row[5], row[6], row[7]))
+				end
+				file:close()
+				filesCreated = filesCreated + 1
+				spEcho("BuildOrderTracker: Exported " .. #reclaims .. " reclaim rows for " .. data.name)
+			end
+		end
 	end
 
 	spEcho("BuildOrderTracker: Created " .. filesCreated .. " file(s)")
@@ -387,11 +477,16 @@ local function trackTeam(teamID, name)
 		name = (name or "team" .. teamID):gsub("[^%w_%-]", "_"),
 		buildEvents = {},
 		resourceRows = {},
+		reclaimRows = {},
 		totalMetalProduced = 0,
 		totalEnergyProduced = 0,
+		-- Seeded from the team's own running totals: enabled mid-game, only what is reclaimed from here on is ours to split.
+		totalMetalReclaimed = spGetTeamRulesParam(teamID, "teamStatsReclaimedMetal") or 0,
+		totalEnergyReclaimed = spGetTeamRulesParam(teamID, "teamStatsReclaimedEnergy") or 0,
 		armyValueBuilt = 0,
 		defenceValueBuilt = 0,
 	}
+	reclaimSeen[teamID] = {}
 end
 
 
@@ -427,6 +522,51 @@ function widget:Shutdown()
 end
 
 
+local function addReclaimRow(rows, gs, reclaimerID, entry, source, metal, energy)
+	if metal <= 0 and energy <= 0 then
+		return
+	end
+	rows[#rows + 1] = { gs, reclaimerID, entry and entry.name or "", entry and entry.defName or "", source, metal, energy }
+end
+
+
+-- Splits what a team's builders took from features in the second just sampled over the builders seen taking part, and brings its running totals up to date.
+-- The totals come from the game's team stats gadget, whose synced half counts every reclaim step into a team rules param; they say *how much*. The polling in trackWorkerTasks says *who*, since a widget sees neither the steps nor whose builder took them: the second's take is split by the build power each builder had in use, and per builder between wrecks and what the map put down in the same proportion.
+-- What no builder was seen for - a tree taken whole between two polls, or a game with no such gadget - goes under no reclaimer rather than onto whoever was nearby. So a second's rows add up to its rise in the totals without anything being invented, and a large unattributed share is itself the sign that the rest is worth less.
+local function writeReclaimRows(data, teamID, gs)
+	-- A total reading lower than the one we hold means the param went unreadable (a team gone, a
+	-- view lost), not that resources came back: hold what we had, or the next readable sample
+	-- would book the whole game as one second.
+	local metalTotal = max(spGetTeamRulesParam(teamID, "teamStatsReclaimedMetal") or 0, data.totalMetalReclaimed)
+	local energyTotal = max(spGetTeamRulesParam(teamID, "teamStatsReclaimedEnergy") or 0, data.totalEnergyReclaimed)
+	local metal = metalTotal - data.totalMetalReclaimed
+	local energy = energyTotal - data.totalEnergyReclaimed
+	data.totalMetalReclaimed = metalTotal
+	data.totalEnergyReclaimed = energyTotal
+
+	local seen = reclaimSeen[teamID]
+	if metal > 0 or energy > 0 then
+		local rows = data.reclaimRows
+		local totalWeight = 0
+		for _, entry in pairs(seen) do
+			totalWeight = totalWeight + entry.weight
+		end
+		if totalWeight > 0 then
+			for reclaimerID, entry in pairs(seen) do
+				local share = entry.weight / totalWeight
+				local wreckShare = entry.wreckWeight / entry.weight
+				addReclaimRow(rows, gs, reclaimerID, entry, "wreck", metal * share * wreckShare, energy * share * wreckShare)
+				local mapShare = share * (1 - wreckShare)
+				addReclaimRow(rows, gs, reclaimerID, entry, "map", metal * mapShare, energy * mapShare)
+			end
+		else
+			addReclaimRow(rows, gs, 0, nil, "unknown", metal, energy)
+		end
+	end
+	reclaimSeen[teamID] = {}
+end
+
+
 -- One row per team per game second. Sampled from GameFrame rather than Update:
 -- Update runs once per *drawn* frame, and a fast replay (or catching up after joining a live game) can run more than a second of sim between two draws, which silently dropped rows and their income from the running totals.
 -- Sampled one frame *into* each second: GameFrame runs before the engine rolls the team's income/expense over on the second's first frame, so sampling on that frame read the previous second's flows next to the current storage.
@@ -434,6 +574,7 @@ local function sampleSecond(gs)
 	local _, _, _, windStrength = spGetWind()
 
 	for teamID, data in pairs(playerData) do
+		writeReclaimRows(data, teamID, gs)
 		local mCurrent, _, mPull, mIncome, mExpense, _, mSent, mReceived, mExcess = spGetTeamResources(teamID, "metal")
 		local eCurrent, _, ePull, eIncome, eExpense, _, eSent, eReceived, eExcess = spGetTeamResources(teamID, "energy")
 		mIncome = mIncome or 0
@@ -457,6 +598,8 @@ local function sampleSecond(gs)
 			data.totalMetalProduced, data.totalEnergyProduced,
 			gs > 0 and data.totalMetalProduced / gs or 0, gs > 0 and data.totalEnergyProduced / gs or 0,
 			data.armyValueBuilt, data.defenceValueBuilt,
+			data.totalMetalReclaimed, data.totalEnergyReclaimed,
+			spGetTeamRulesParam(teamID, "mmCapacity") or 0, spGetTeamRulesParam(teamID, "mmUse") or 0,
 		}
 	end
 end
@@ -497,12 +640,15 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerD
 	local tracking = reclaimTracking[unitID]
 	reclaimTracking[unitID] = nil
 
-	-- Log a reclaim only if a tracked builder was actively reclaiming this unit right up until it disappeared (last seen within the stale window). We rely on the observed reclaim task rather than the death's weaponDefID, which isn't reliably the engine's Reclaimed damage type across game/engine versions.
+	-- Log a reclaim only if a tracked builder was seen reclaiming this unit right up until it disappeared (within the stale window), which is also what names the reclaimer - and only if the engine's own cause of death agrees: something an enemy shells first, or whose owner self-destructs it, was not reclaimed. A death the engine names no cause for falls back to the stale window alone.
 	local gameTime = spGetGameSeconds()
 	if not tracking or not playerData[unitTeam] then
 		return
 	end
 	if (gameTime - tracking.lastSeen) > RECLAIM_STALE_SECONDS then
+		return
+	end
+	if weaponDefID and (OTHER_CAUSE[weaponDefID] or (WeaponDefs[weaponDefID] and not RECLAIM_CAUSE[weaponDefID])) then
 		return
 	end
 

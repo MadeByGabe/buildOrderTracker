@@ -7,10 +7,12 @@ A [Beyond All Reason](https://www.beyondallreason.info/) widget that records bui
 - Tracks every unit completion: what was built, which builder built it, when, and how long construction took
 - Tracks which other builders assisted each build (guarding cons, nano turrets, the commander helping), and for how long
 - Tracks when players reclaim their own finished units (e.g. wind turbines, to make room), with the reclaimer and how long it took
+- Tracks feature reclaim (wrecks, rocks, trees) per second **and per reclaiming unit**, so you can tell what a given constructor actually brought in and when
 - Records per-second snapshots of metal/energy income, expense, pull, excess, storage, and transfers between allies
 - Tracks the build power actually in use (idle or stalled builders don't count)
 - Accumulates total metal and energy produced, plus running averages
 - Tracks the metal value of army and defences built
+- Records energy converter capacity and use
 - Appends extraction rate to MEX unit names (e.g. `Metal Extractor:2.40`)
 - Records when the game was played, and lets you name the build order when exporting
 - Provides a `/export_bo` chat command to write files at any point during or after the match
@@ -46,7 +48,10 @@ Files are named using the player name, map name (shortened to 20 characters), an
 ```
 builddata_PlayerName_some_map_name_20260415_183000.tsv
 resourcedata_PlayerName_some_map_name_20260415_183000.tsv
+reclaimdata_PlayerName_some_map_name_20260415_183000.tsv
 ```
+
+The reclaim file is only written when something was reclaimed.
 
 You can run `/export_bo` multiple times; each call overwrites the files for that session.
 
@@ -118,8 +123,40 @@ One row per game second. Stored values and build power are a snapshot at the sta
 | `metal_average`, `energy_average` | Total produced divided by game seconds |
 | `army_value_built` | Cumulative metal cost of finished armed mobile units (excluding commanders) |
 | `defence_value_built` | Cumulative metal cost of finished armed static units |
+| `total_metal_reclaimed`, `total_energy_reclaimed` | Cumulative resources this team's builders took from features (wrecks, rocks, trees) |
+| `converter_capacity` | Energy the team's converters could turn into metal per second |
+| `converter_use` | Energy they actually converted per second |
 
 The army and defence values count what has been built; losses aren't subtracted.
+
+Reclaim is part of `metal_income`/`energy_income`, not on top of it. The totals come from the game's team stats gadget, which counts every reclaim step on the synced side; in a game without that gadget both columns stay at zero, and no reclaim file is written. Reclaiming a *unit* is a separate thing, logged in `builddata_*.tsv`.
+
+### `reclaimdata_*.tsv`
+
+One row per game second per reclaiming unit per source, written only for seconds in which something was reclaimed. This is what answers questions like *"how much energy per second did that early Reclaim Bot actually bring in, and from when?"* — filter to one `reclaimer_id` and read off the rate.
+
+| Column | Description |
+|---|---|
+| `time` | Game second |
+| `reclaimer_id` | Unit ID of the builder credited, or `0` when it could not be attributed |
+| `reclaimer` | Translated builder name, e.g. `Rez Bot`; empty when unattributed |
+| `reclaimer_def` | Internal builder name, e.g. `armrectr`; empty when unattributed |
+| `source` | `map` for what the map put down (trees, rocks), `wreck` for a unit's corpse, `unknown` when unattributed |
+| `metal`, `energy` | Taken that second |
+
+`reclaimer_id` joins to the builder's unit ID in `builddata_*.tsv`, so a reclaimer can be traced back to when and by what it was built.
+
+#### How attribution works, and what it can't tell you
+
+A widget can see neither the reclaim steps nor whose builder took a feature's resources — that only exists on the synced side. So the two halves come from different places: the team's running totals say **how much**, and polling each builder's current task five times a second says **who**. Each second's total is split over the builders seen reclaiming, weighted by the build power each had in use, and then split per builder between `map` and `wreck` in the same proportion.
+
+This means:
+
+- A builder with a reclaim order that is still walking to its target applies no build power and is credited nothing.
+- When two builders reclaim at once, the split is proportional, not measured. With one reclaimer — the usual case early on, and the case the tool is aimed at — it is exact.
+- Anything no builder was seen for, such as a tree taken apart entirely between two polls, is written under `reclaimer_id` `0` with source `unknown` rather than spread over whoever happened to be nearby. Nothing is invented, and a large `unknown` share is a signal to trust the per-unit rows less.
+- Each second's rows add up exactly to that second's rise in `total_metal_reclaimed`/`total_energy_reclaimed`.
+- Enabled mid-game, the running totals start at whatever the team had already reclaimed, but only what is reclaimed from then on gets per-unit rows.
 
 ## Author
 
