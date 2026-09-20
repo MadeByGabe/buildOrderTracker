@@ -11,8 +11,8 @@ function widget:GetInfo()
 end
 
 
--- Export format version, written into each file's "#" metadata line
-local FORMAT_VERSION = 5
+-- Export format version, written into each file's "#" metadata line. 6 records build priority (see priorityMark).
+local FORMAT_VERSION = 6
 
 -- Localized Spring API
 local spGetSpectatingState = Spring.GetSpectatingState
@@ -36,6 +36,8 @@ local spGetUnitIsBeingBuilt = Spring.GetUnitIsBeingBuilt
 local spGetUnitCurrentBuildPower = Spring.GetUnitCurrentBuildPower
 local spGetUnitMetalExtraction = Spring.GetUnitMetalExtraction
 local spGetUnitWorkerTask = Spring.GetUnitWorkerTask
+local spFindUnitCmdDesc = Spring.FindUnitCmdDesc
+local spGetUnitCmdDescs = Spring.GetUnitCmdDescs
 local spGetUnitTeam = Spring.GetUnitTeam
 local spValidUnitID = Spring.ValidUnitID
 local spValidFeatureID = Spring.ValidFeatureID
@@ -53,6 +55,8 @@ local ipairs = ipairs
 
 -- Localized CMD constants
 local CMD_RECLAIM = CMD.RECLAIM
+-- Build priority (the Builder Priority gadget): an ICON_MODE state on every builder that can be set passive, mode 0 = Low Prio, 1 = High Prio (the default)
+local CMD_PRIORITY = GameCMD and GameCMD.PRIORITY
 
 local GAME_SPEED = Game.gameSpeed or 30
 local MAX_UNITS = Game.maxUnits or 32000
@@ -74,9 +78,44 @@ local playerData = {}
 local buildStartTimes = {} -- unitID -> game seconds when construction began
 local reclaimTracking = {} -- target unitID -> reclaim start time and reclaimer info
 local RECLAIM_STALE_SECONDS = 1.5 -- reclaim considered abandoned if no builder seen working on it for this long
-local assistTimes = {} -- unitID under construction -> { [assisting builder's unitID] = seconds seen working on it }
+local assistTimes = {} -- unitID under construction -> { [assisting builder's unitID] = { seconds = seen working on it, polls = priority polls, low = those that saw Low Prio } }
 local WORKER_POLL_FRAMES = 6 -- how often builders' worker tasks are polled
 local WORKER_POLL_SECONDS = WORKER_POLL_FRAMES / GAME_SPEED
+-- Whether a builder is set to Low Prio right now, read off the Builder Priority gadget's own command state. nil for a unit that has no such state, which is the same as High.
+local function isLowPriority(unitID)
+	if not CMD_PRIORITY then
+		return nil
+	end
+	local index = spFindUnitCmdDesc(unitID, CMD_PRIORITY)
+	if not index then
+		return nil
+	end
+	local descs = spGetUnitCmdDescs(unitID, index, index)
+	local mode = descs and descs[1] and descs[1].params and tonumber(descs[1].params[1])
+	return mode ~= nil and mode == 0
+end
+
+
+-- One look at a builder's priority while it works on a build, onto the tally its mark is written from. The player can change priority mid-build, so what a row gets is what held for most of it.
+local function pollPriority(tally, unitID)
+	local low = isLowPriority(unitID)
+	if low == nil then
+		return
+	end
+	tally.polls = (tally.polls or 0) + 1
+	if low then
+		tally.low = (tally.low or 0) + 1
+	end
+end
+
+
+-- What a tally writes after a builder in a built_by cell: "-" when it spent most of the build on Low Prio, nothing otherwise. High is the default and the usual case, so it goes unwritten and a reader takes an unmarked builder as high; "+" means high too, and is accepted but never written.
+local function priorityMark(tally)
+	local polls = tally and tally.polls or 0
+	return (polls > 0 and (tally.low or 0) * 2 > polls) and "-" or ""
+end
+
+
 -- An assistant that helped for all but this much of a build is written without its seconds (a constant nano turret, a con guarding the factory): the larger of the two
 local ASSIST_FULL_SLACK = 0.6
 local ASSIST_FULL_FRACTION = 0.05
@@ -234,6 +273,14 @@ end
 -- Feature reclaim: a builder taking a wreck, rock or tree apart is weighed by the build power it has in use, for the per-second split in writeReclaimRows.
 -- Assist: a builder working on a unit under construction that some other unit started (a con guarding the factory, a nano turret, the commander helping a con's mex) is credited one poll interval of help on that unit. UnitFinished writes the tally into the unit's built_by cell.
 local function trackWorkerTasks(gameTime)
+	-- Build priority of whoever started each unit still under construction. Taken
+	-- from the nanoframe rather than from the builder's worker task, since a
+	-- factory reports no worker task for what it is producing.
+	for _, buildInfo in pairs(buildStartTimes) do
+		if buildInfo.builderID then
+			pollPriority(buildInfo, buildInfo.builderID)
+		end
+	end
 	for teamID in pairs(playerData) do
 		for _, unitID in ipairs(spGetTeamUnits(teamID)) do
 			local unitDefID = spGetUnitDefID(unitID)
@@ -248,7 +295,14 @@ local function trackWorkerTasks(gameTime)
 							times = {}
 							assistTimes[targetID] = times
 						end
-						times[unitID] = (times[unitID] or 0) + WORKER_POLL_SECONDS
+						local tally = times[unitID]
+						if not tally then
+							tally = { seconds = 0 }
+							times[unitID] = tally
+						end
+						tally.seconds = tally.seconds + WORKER_POLL_SECONDS
+						-- an assistant queues for resources on its own priority, not the priority of the build it helps
+						pollPriority(tally, unitID)
 					end
 				end
 				if taskCmdID == CMD_RECLAIM and targetID then
@@ -306,7 +360,7 @@ local function isDefenceUnit(unitDef)
 end
 
 
--- The assistants of a finished unit, as the suffix of its built_by cell: "11501,27409=2.1" — a builder's unitID, with the seconds it helped unless it helped (nearly) the whole build. nil when nobody assisted.
+-- The assistants of a finished unit, as the suffix of its built_by cell: "11501,27409-=2.1" — a builder's unitID, a "-" if it helped on Low Prio, and the seconds it helped unless it helped (nearly) the whole build. nil when nobody assisted.
 local function assistCell(times, duration)
 	if not times then
 		return nil
@@ -322,11 +376,13 @@ local function assistCell(times, duration)
 	local slack = duration and max(ASSIST_FULL_SLACK, ASSIST_FULL_FRACTION * duration)
 	local cells = {}
 	for i, builderID in ipairs(ids) do
-		local seconds = times[builderID]
+		local tally = times[builderID]
+		local seconds = tally.seconds
+		local mark = priorityMark(tally)
 		if slack and seconds >= duration - slack then
-			cells[i] = tostring(builderID)
+			cells[i] = builderID .. mark
 		else
-			cells[i] = builderID .. "=" .. format("%.1f", seconds)
+			cells[i] = builderID .. mark .. "=" .. format("%.1f", seconds)
 		end
 	end
 	return concat(cells, ",")
@@ -618,11 +674,16 @@ function widget:UnitCreated(unitID, unitDefID, unitTeam, builderID)
 				builderName = UnitDefs[builderDefID].translatedHumanName
 			end
 		end
-		buildStartTimes[unitID] = {
+		local buildInfo = {
 			startTime = spGetGameSeconds(),
 			builderName = builderName,
 			builderID = builderID,
 		}
+		-- a build that finishes inside one poll interval is never polled, so look once here
+		if builderID then
+			pollPriority(buildInfo, builderID)
+		end
+		buildStartTimes[unitID] = buildInfo
 	end
 end
 
@@ -710,7 +771,7 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
 
 	local builderStr = nil
 	if builderName and builderID then
-		builderStr = builderName .. " (" .. builderID .. ")"
+		builderStr = builderName .. " (" .. builderID .. ")" .. priorityMark(buildInfo)
 	elseif builderName then
 		builderStr = builderName
 	end
