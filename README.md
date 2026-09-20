@@ -160,7 +160,7 @@ One row per game second. Stored values and build power are a snapshot at the sta
 
 The army and defence values count what has been built; losses aren't subtracted.
 
-Reclaim is part of `metal_income`/`energy_income`, not on top of it. The totals come from the game's team stats gadget, which counts every reclaim step on the synced side; in a game without that gadget both columns stay at zero and the `reclaim` block is empty. Reclaiming a *unit* is a separate thing, logged in the `build` block.
+Reclaim is part of `metal_income`/`energy_income`, not on top of it. The totals come from the game's team stats gadget, which counts every reclaim step on the synced side; in a game without that gadget both columns stay at zero and the `reclaim` block is empty. Reclaiming a *unit* is a separate thing, logged in the `build` block. Only same-team reclaim is logged there (the team both owns the reclaimed unit and gets the refund). If an enemy reclaims your unit, that is treated as a loss event, not as your reclaim income correction.
 
 ### The `reclaim` block
 

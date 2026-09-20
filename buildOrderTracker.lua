@@ -275,7 +275,8 @@ local function trackWorkerTasks(gameTime)
 						end
 					elseif spValidUnitID(targetID) and not targetBeingBuilt then
 						local targetTeam = spGetUnitTeam(targetID)
-						if targetTeam and playerData[targetTeam] then
+						-- Only treat unit reclaim as a "build reclaim" for the team that owns both the reclaimer and the target. Enemy reclaim is a loss for the victim team.
+						if targetTeam and targetTeam == teamID and playerData[targetTeam] then
 							local tracking = reclaimTracking[targetID]
 							if not tracking or (gameTime - tracking.lastSeen) > RECLAIM_STALE_SECONDS then
 								reclaimTracking[targetID] = {
