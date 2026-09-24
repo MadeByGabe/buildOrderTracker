@@ -24,6 +24,7 @@ local spGetMyPlayerID = Spring.GetMyPlayerID
 local spGetMyTeamID = Spring.GetMyTeamID
 local spGetTeamList = Spring.GetTeamList
 local spGetTeamInfo = Spring.GetTeamInfo
+local spGetTeamColor = Spring.GetTeamColor
 local spGetTeamLuaAI = Spring.GetTeamLuaAI
 local spGetAIInfo = Spring.GetAIInfo
 local spGetGameSeconds = Spring.GetGameSeconds
@@ -214,14 +215,29 @@ local function gamePlayedTime(gameID)
 end
 
 
+-- The team's colour as "#rrggbb", as this client shows it (the game can recolour teams, e.g. for colourblind players), or "?"
+local function teamColor(teamID)
+	local r, g, b = spGetTeamColor(teamID)
+	if not r then
+		return "?"
+	end
+	local byte = function(v)
+		return math.floor(math.max(0, math.min(1, v)) * 255 + 0.5)
+	end
+	return format("#%02x%02x%02x", byte(r), byte(g), byte(b))
+end
+
+
 -- First line of every export: "#" plus tab-separated key=value pairs, so the files carry their own context (the filename timestamp is when the widget loaded, not when the game was played)
-local function metadataLine(data, buildName)
+local function metadataLine(teamID, data, buildName)
 	local gameID = getGameID()
 	local played = gamePlayedTime(gameID)
 	local fields = {
 		"# buildOrderTracker",
 		"version=" .. FORMAT_VERSION,
 		"player=" .. data.name,
+		-- so a chart of this build can draw it in the colour it had in game
+		"color=" .. teamColor(teamID),
 		"map=" .. (Game.mapName or "?"),
 		"game=" .. (Game.gameName or "?") .. " " .. (Game.gameVersion or ""),
 		"gameID=" .. tostring(gameID or "?"),
@@ -453,12 +469,12 @@ local function exportData(buildName)
 	ensureExportDir()
 	local filesCreated = 0
 
-	for _, data in pairs(playerData) do
+	for teamID, data in pairs(playerData) do
 		if #data.buildEvents > 0 or #data.resourceRows > 0 then
 			local filename = generateFilename("buildorder_" .. data.name, "tsv")
 			local file = ioOpen(filename, "w")
 			if file then
-				file:write(metadataLine(data, buildName))
+				file:write(metadataLine(teamID, data, buildName))
 				writeBuildSection(file, data.buildEvents)
 				writeResourceSection(file, data.resourceRows)
 				writeReclaimSection(file, data.reclaimRows)

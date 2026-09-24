@@ -100,6 +100,7 @@ The first line of the file starts with `#` and holds tab-separated `key=value` p
 |---|---|
 | `version` | Export format version |
 | `player` | Player name |
+| `color` | The team's colour as `#rrggbb`, as the exporting client shows it; `?` if unavailable |
 | `map` | Map name |
 | `game` | Game name and version |
 | `gameID` | Engine game ID |
