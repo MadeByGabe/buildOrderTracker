@@ -6,6 +6,7 @@ A [Beyond All Reason](https://www.beyondallreason.info/) widget that records bui
 
 - Tracks every unit completion: what was built, which builder built it, when, and how long construction took
 - Tracks which other builders assisted each build (guarding cons, nano turrets, the commander helping), and for how long
+- Tracks units given to or received from a teammate
 - Tracks when players reclaim their own finished units (e.g. wind turbines, to make room), with the reclaimer and how long it took
 - Tracks feature reclaim (wrecks, rocks, trees) per second **and per reclaiming unit**, so you can tell what a given constructor actually brought in and when
 - Records per-second snapshots of metal/energy income, expense, pull, excess, storage, and transfers between allies
@@ -117,15 +118,25 @@ The first line of the file starts with `#` and holds tab-separated `key=value` p
 
 ### The `build` block
 
-One row per finished unit, plus one per reclaimed unit, sorted by start time.
+One row per finished unit, plus one per reclaimed unit and one per unit given to or received from a teammate, sorted by start time.
 
 | Column | Description |
 |---|---|
 | `unit_name` | Translated unit name followed by unit ID, e.g. `Wind Turbine (1234)`. MEXes include the extraction rate (`Metal Extractor:2.40 (1234)`). Reclaimed units start with `-` (`-Wind Turbine (1234)`) |
-| `built_by` | Builder name and ID; for reclaims, the unit that reclaimed it. Empty if unknown. Assistants follow after a `:` (see below) |
-| `start_time` | Game time when construction started, or when the reclaim started (seconds). If the start wasn't seen, the time it finished instead |
-| `build_duration` | How long construction took, or how long the reclaim took (seconds). Empty if the start wasn't seen |
+| `built_by` | Builder name and ID; for reclaims, the unit that reclaimed it; `received` or `sent` for a unit that changed hands (see below). Empty if unknown. Assistants follow after a `:` (see below) |
+| `start_time` | Game time when construction started, when the reclaim started, or when the unit changed hands (seconds). If a build's start wasn't seen, the time it finished instead |
+| `build_duration` | How long construction took, or how long the reclaim took (seconds). Empty if the start wasn't seen, and for units that changed hands |
 | `unit_def` | Internal unit name (e.g. `armwin`), the same in every game language |
+
+#### Units given between teammates
+
+A unit a teammate gave this player, or this player gave a teammate, is a row with `received` or `sent` in `built_by`:
+
+```
+Advanced Construction Bot (1234)	received	612.40		corack
+```
+
+The unit ID stays the same across the transfer, so it joins to the row where the unit was built, in whichever player's file that is. When both players are tracked, each file gets its side of the transfer. A player leaving the game hands all their units to a teammate, which shows up as a burst of `received` rows. Units taken by an enemy (captured) are not logged.
 
 #### Assistants
 

@@ -11,8 +11,8 @@ function widget:GetInfo()
 end
 
 
--- Export format version, written into each file's "#" metadata line. 6 records build priority (see priorityMark), 7 adds the idle block.
-local FORMAT_VERSION = 7
+-- Export format version, written into each file's "#" metadata line. 6 records build priority (see priorityMark), 7 adds the idle block, 8 units given between allies.
+local FORMAT_VERSION = 8
 
 -- Localized Spring API
 local spGetSpectatingState = Spring.GetSpectatingState
@@ -42,6 +42,7 @@ local spGetFactoryCommandCount = Spring.GetFactoryCommandCount
 local spFindUnitCmdDesc = Spring.FindUnitCmdDesc
 local spGetUnitCmdDescs = Spring.GetUnitCmdDescs
 local spGetUnitTeam = Spring.GetUnitTeam
+local spAreTeamsAllied = Spring.AreTeamsAllied
 local spValidUnitID = Spring.ValidUnitID
 local spValidFeatureID = Spring.ValidFeatureID
 local spGetFeatureDefID = Spring.GetFeatureDefID
@@ -856,6 +857,38 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerD
 end
 
 
+-- A unit's name in the build block, with a mex's extraction rate appended: "Metal Extractor:2.40"
+local function unitDisplayName(unitID, unitDefID, unitDef)
+	if isMex[unitDefID] then
+		return unitDef.translatedHumanName .. ":" .. format("%.2f", spGetUnitMetalExtraction(unitID) or 0)
+	end
+	return unitDef.translatedHumanName
+end
+
+
+-- A unit given from one ally to another is a row in the build block of each side that is tracked: "received" or "sent" in place of a builder, at the moment it changed hands, with no duration. A unit taken by an enemy (captured) is left out, and so is one still being built: it gets its row when it's finished, as any other unit does.
+function widget:UnitGiven(unitID, unitDefID, newTeam, oldTeam)
+	local unitDef = UnitDefs[unitDefID]
+	if not unitDef or not (playerData[newTeam] or playerData[oldTeam]) or not spAreTeamsAllied(newTeam, oldTeam) or spGetUnitIsBeingBuilt(unitID) then
+		return
+	end
+	local gameTime = spGetGameSeconds()
+	local unitName = unitDisplayName(unitID, unitDefID, unitDef)
+	for teamID, direction in pairs({ [newTeam] = "received", [oldTeam] = "sent" }) do
+		local data = playerData[teamID]
+		if data then
+			data.buildEvents[#data.buildEvents + 1] = {
+				unitName = unitName,
+				unitDefName = unitDef.name,
+				unitID = unitID,
+				builderName = direction,
+				startTime = gameTime,
+			}
+		end
+	end
+end
+
+
 function widget:UnitFinished(unitID, unitDefID, unitTeam)
 	local unitDef = UnitDefs[unitDefID]
 	if not unitDef then
@@ -874,11 +907,7 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
 
 	-- Track build event
 	local gameTime = spGetGameSeconds()
-	local unitName = unitDef.translatedHumanName
-	if isMex[unitDefID] then
-		local metalExtract = spGetUnitMetalExtraction(unitID) or 0
-		unitName = unitName .. ":" .. format("%.2f", metalExtract)
-	end
+	local unitName = unitDisplayName(unitID, unitDefID, unitDef)
 	local buildInfo = buildStartTimes[unitID]
 	local startTime = buildInfo and buildInfo.startTime or nil
 	local builderName = buildInfo and buildInfo.builderName or nil
