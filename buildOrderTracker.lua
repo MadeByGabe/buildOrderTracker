@@ -11,8 +11,8 @@ function widget:GetInfo()
 end
 
 
--- Export format version, written into each file's "#" metadata line. 6 records build priority (see priorityMark).
-local FORMAT_VERSION = 6
+-- Export format version, written into each file's "#" metadata line. 6 records build priority (see priorityMark), 7 adds the idle block.
+local FORMAT_VERSION = 7
 
 -- Localized Spring API
 local spGetSpectatingState = Spring.GetSpectatingState
@@ -37,6 +37,8 @@ local spGetUnitIsBeingBuilt = Spring.GetUnitIsBeingBuilt
 local spGetUnitCurrentBuildPower = Spring.GetUnitCurrentBuildPower
 local spGetUnitMetalExtraction = Spring.GetUnitMetalExtraction
 local spGetUnitWorkerTask = Spring.GetUnitWorkerTask
+local spGetUnitCommandCount = Spring.GetUnitCommandCount
+local spGetFactoryCommandCount = Spring.GetFactoryCommandCount
 local spFindUnitCmdDesc = Spring.FindUnitCmdDesc
 local spGetUnitCmdDescs = Spring.GetUnitCmdDescs
 local spGetUnitTeam = Spring.GetUnitTeam
@@ -122,15 +124,24 @@ local ASSIST_FULL_SLACK = 0.6
 local ASSIST_FULL_FRACTION = 0.05
 -- [teamID][reclaimerID] = { weight, wreckWeight, name, defName }: the builders seen reclaiming a feature since the last sample, each weighed by the build power it had in use. Cleared by writeReclaimRows, which splits the second's take over them.
 local reclaimSeen = {}
+-- unitID -> { teamID, unitDefID, startTime, poll }: the builders idle right now, since when, and the last poll that saw them idle. A stretch ends as a row of its team's idleRows (see closeIdleStretch).
+local idleStretches = {}
+local workerPoll = 0 -- counts trackWorkerTasks calls, so a stretch whose unit no poll saw (dead, given away) can be told apart
 local exportDirCreated = false
 local gameIDHex -- from the GameID callin; missed if the widget is enabled after the game started, hence the fallbacks in getGameID
 
 -- Per-unitDef lookups, built once
 local builderSpeed = {} -- unitDefID -> buildSpeed, for anything that can build
 local isMex = {} -- unitDefID -> true for metal extractors (incl. Exploiters, Twilight, naval/T1.5/T2 variants)
+local isFactory = {} -- unitDefID -> true for factories, whose build queue is separate from their command queue
+local tracksIdle = {} -- unitDefID -> true for the builders the idle block covers: every one but air repair pads, which have build power only to repair aircraft
 for unitDefID, unitDef in pairs(UnitDefs) do
 	if (unitDef.buildSpeed or 0) > 0 then
 		builderSpeed[unitDefID] = unitDef.buildSpeed
+		tracksIdle[unitDefID] = not unitDef.customParams.isairbase or nil
+	end
+	if unitDef.isFactory then
+		isFactory[unitDefID] = true
 	end
 	if (unitDef.extractsMetal or 0) > 0 then
 		isMex[unitDefID] = true
@@ -173,6 +184,11 @@ local BUILD_COLUMNS = {
 -- Reclaim data columns, in export order: one row per reclaiming unit per source, and only for a second in which something was reclaimed. See writeReclaimRows.
 local RECLAIM_COLUMNS = {
 	"time", "reclaimer_id", "reclaimer", "reclaimer_def", "source", "metal", "energy",
+}
+
+-- Idle data columns, in export order: one row per stretch a builder spent with nothing to do. See isIdle.
+local IDLE_COLUMNS = {
+	"start_time", "duration", "unit_id", "unit", "unit_def",
 }
 
 local function generateFilename(prefix, extension)
@@ -284,11 +300,48 @@ local function workerTaskFeature(targetID)
 end
 
 
+-- Whether a builder has nothing to do: no orders queued (for a factory, nothing in its build queue) and no worker task. The worker task is what keeps a nano turret, or a con left to its own devices, from counting as idle while it assists or repairs with no order given. A con with a guard or patrol order is not idle, even when the factory it guards has nothing to build.
+local function isIdle(unitID, unitDefID, taskCmdID)
+	if taskCmdID or not tracksIdle[unitDefID] then
+		return false
+	end
+	local count
+	if isFactory[unitDefID] then
+		count = spGetFactoryCommandCount(unitID)
+	else
+		count = spGetUnitCommandCount(unitID)
+	end
+	return count == 0
+end
+
+
+-- A row of the idle block, for a stretch that ran until endTime
+local function idleRow(unitID, stretch, endTime)
+	local unitDef = UnitDefs[stretch.unitDefID]
+	return { stretch.startTime, endTime - stretch.startTime, unitID, unitDef.translatedHumanName, unitDef.name }
+end
+
+
+local function closeIdleStretch(unitID, endTime)
+	local stretch = idleStretches[unitID]
+	if not stretch then
+		return
+	end
+	idleStretches[unitID] = nil
+	local data = playerData[stretch.teamID]
+	if data then
+		data.idleRows[#data.idleRows + 1] = idleRow(unitID, stretch, endTime)
+	end
+end
+
+
 -- Widgets (LuaUI) don't receive reclaim or assist callins, so we poll each builder's current worker task.
 -- Reclaim: when a tracked builder is reclaiming a completed unit that belongs to a tracked team, we record when the reclaim was first seen (its start) and keep the "last seen" timestamp fresh while it continues. UnitDestroyed then turns a tracked-and-still-active reclaim into a logged event.
 -- Feature reclaim: a builder taking a wreck, rock or tree apart is weighed by the build power it has in use, for the per-second split in writeReclaimRows.
 -- Assist: a builder working on a unit under construction that some other unit started (a con guarding the factory, a nano turret, the commander helping a con's mex) is credited one poll interval of help on that unit. UnitFinished writes the tally into the unit's built_by cell.
+-- Idle: a builder seen idle opens a stretch at this poll, and the first poll that sees it busy, or doesn't see it at all, closes it. Stretches are only as exact as the poll interval.
 local function trackWorkerTasks(gameTime)
+	workerPoll = workerPoll + 1
 	-- Build priority of whoever started each unit still under construction. Taken
 	-- from the nanoframe rather than from the builder's worker task, since a
 	-- factory reports no worker task for what it is producing.
@@ -302,6 +355,20 @@ local function trackWorkerTasks(gameTime)
 			local unitDefID = spGetUnitDefID(unitID)
 			if builderSpeed[unitDefID] and not spGetUnitIsBeingBuilt(unitID) then
 				local taskCmdID, targetID = spGetUnitWorkerTask(unitID)
+				local stretch = idleStretches[unitID]
+				if stretch and stretch.teamID ~= teamID then -- given to another tracked team: the idle time so far was its old team's
+					closeIdleStretch(unitID, gameTime)
+					stretch = nil
+				end
+				if isIdle(unitID, unitDefID, taskCmdID) then
+					if not stretch then
+						stretch = { teamID = teamID, unitDefID = unitDefID, startTime = gameTime }
+						idleStretches[unitID] = stretch
+					end
+					stretch.poll = workerPoll
+				elseif stretch then
+					closeIdleStretch(unitID, gameTime)
+				end
 				local targetBeingBuilt = targetID and spValidUnitID(targetID) and spGetUnitIsBeingBuilt(targetID)
 				if taskCmdID and taskCmdID < 0 and targetBeingBuilt then -- build commands are the negative unitDefID; excludes capturing a nanoframe
 					local buildInfo = buildStartTimes[targetID]
@@ -364,6 +431,12 @@ local function trackWorkerTasks(gameTime)
 			end
 		end
 	end
+	-- A stretch this poll didn't touch is a builder no tracked team has any more: it died, or was given away
+	for unitID, stretch in pairs(idleStretches) do
+		if stretch.poll ~= workerPoll then
+			closeIdleStretch(unitID, gameTime)
+		end
+	end
 end
 
 
@@ -421,7 +494,7 @@ local function eventsByStartTime(buildEvents)
 end
 
 
--- The three kinds of data are three different shapes - one row per unit event, one per game second, one per second per reclaiming unit - so they are written as three blocks of one file rather than joined into a table none of them fits. A block opens with a blank line, a "## <name>" marker and its own header row, which is all a reader needs to split the file back into three tables; the metadata line at the top then covers all three at once.
+-- The four kinds of data are four different shapes - one row per unit event, one per game second, one per second per reclaiming unit, one per idle stretch - so they are written as four blocks of one file rather than joined into a table none of them fits. A block opens with a blank line, a "## <name>" marker and its own header row, which is all a reader needs to split the file back into four tables; the metadata line at the top then covers all of them at once.
 local function beginSection(file, name, columns)
 	file:write("\n## " .. name .. "\n" .. concat(columns, "\t") .. "\n")
 end
@@ -464,7 +537,32 @@ local function writeReclaimSection(file, rows)
 end
 
 
--- One file per tracked player. All three blocks are written even when a block has no rows - a game where nothing was reclaimed still gets an empty reclaim block - so every file has the same shape and a reader never has to tell a missing block from an empty one.
+-- Stretches are logged when they end, and are written in the order they started; one still running at export time is written up to now.
+local function writeIdleSection(file, teamID, rows)
+	beginSection(file, "idle", IDLE_COLUMNS)
+	local sorted = {}
+	for i, row in ipairs(rows) do
+		sorted[i] = row
+	end
+	local now = spGetGameSeconds()
+	for unitID, stretch in pairs(idleStretches) do
+		if stretch.teamID == teamID then
+			sorted[#sorted + 1] = idleRow(unitID, stretch, now)
+		end
+	end
+	table.sort(sorted, function(a, b)
+		if a[1] ~= b[1] then
+			return a[1] < b[1]
+		end
+		return a[3] < b[3]
+	end)
+	for _, row in ipairs(sorted) do
+		file:write(format("%.2f\t%.2f\t%d\t%s\t%s\n", row[1], row[2], row[3], row[4], row[5]))
+	end
+end
+
+
+-- One file per tracked player. All four blocks are written even when a block has no rows - a game where nothing was reclaimed still gets an empty reclaim block - so every file has the same shape and a reader never has to tell a missing block from an empty one.
 local function exportData(buildName)
 	ensureExportDir()
 	local filesCreated = 0
@@ -478,10 +576,11 @@ local function exportData(buildName)
 				writeBuildSection(file, data.buildEvents)
 				writeResourceSection(file, data.resourceRows)
 				writeReclaimSection(file, data.reclaimRows)
+				writeIdleSection(file, teamID, data.idleRows)
 				file:close()
 				filesCreated = filesCreated + 1
 				spEcho("BuildOrderTracker: Exported " .. data.name .. " - " .. #data.buildEvents .. " build events, "
-					.. #data.resourceRows .. " data points, " .. #data.reclaimRows .. " reclaim rows")
+					.. #data.resourceRows .. " data points, " .. #data.reclaimRows .. " reclaim rows, " .. #data.idleRows .. " idle stretches")
 			end
 		end
 	end
@@ -554,6 +653,7 @@ local function trackTeam(teamID, name)
 		buildEvents = {},
 		resourceRows = {},
 		reclaimRows = {},
+		idleRows = {},
 		totalMetalProduced = 0,
 		totalEnergyProduced = 0,
 		-- Seeded from the team's own running totals: enabled mid-game, only what is reclaimed from here on is ours to split.

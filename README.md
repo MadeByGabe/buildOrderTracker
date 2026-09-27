@@ -10,13 +10,14 @@ A [Beyond All Reason](https://www.beyondallreason.info/) widget that records bui
 - Tracks feature reclaim (wrecks, rocks, trees) per second **and per reclaiming unit**, so you can tell what a given constructor actually brought in and when
 - Records per-second snapshots of metal/energy income, expense, pull, excess, storage, and transfers between allies
 - Tracks the build power actually in use (idle or stalled builders don't count)
+- Records when each builder and factory sat idle with nothing to do, so time spent walking between tasks can be told apart from time nobody gave it orders
 - Accumulates total metal and energy produced, plus running averages
 - Tracks the metal value of army and defences built
 - Records energy converter capacity and use
 - Appends extraction rate to MEX unit names (e.g. `Metal Extractor:2.40`)
 - Records when the game was played, and lets you name the build order when exporting
 - Provides a `/export_bo` chat command to write files at any point during or after the match
-- Exports one TSV per player, holding the build, resource and reclaim data as three labelled blocks
+- Exports one TSV per player, holding the build, resource, reclaim and idle data as four labelled blocks
 
 ## Installation
 
@@ -56,10 +57,10 @@ Any text after the command is saved as the build order's name in the files, e.g.
 
 ## Output Format
 
-Each file holds all three kinds of data as three blocks. They are three different shapes — one row per unit event, one row per game second, one row per second per reclaiming unit — so joining them into a single table would mean denormalizing two of them into a grain they don't fit. Instead each block opens with a blank line, a `## <name>` marker and its own header row:
+Each file holds all four kinds of data as four blocks. They are four different shapes — one row per unit event, one row per game second, one row per second per reclaiming unit, one row per idle stretch — so joining them into a single table would mean denormalizing three of them into a grain they don't fit. Instead each block opens with a blank line, a `## <name>` marker and its own header row:
 
 ```
-# buildOrderTracker	version=5	player=...	map=...
+# buildOrderTracker	version=7	player=...	map=...
 
 ## build
 unit_name	built_by	start_time	build_duration	unit_def
@@ -72,9 +73,13 @@ time	wind_speed	metal_stored	...	converter_use
 ## reclaim
 time	reclaimer_id	reclaimer	reclaimer_def	source	metal	energy
 41	10	Rez Bot	armrectr	map	0.00	20.00
+
+## idle
+start_time	duration	unit_id	unit	unit_def
+41.20	6.40	11501	Construction Bot	armck
 ```
 
-All three blocks are always present; one with nothing to report is written as a bare header row, so a reader never has to tell a missing block from an empty one. Splitting the file back into three tables takes a few lines:
+All four blocks are always present; one with nothing to report is written as a bare header row, so a reader never has to tell a missing block from an empty one. Splitting the file back into four tables takes a few lines:
 
 ```python
 meta, sections, name = {}, {}, None
@@ -94,7 +99,7 @@ for line in open(path, encoding="utf-8"):
 
 ### Metadata line
 
-The first line of the file starts with `#` and holds tab-separated `key=value` pairs, covering all three blocks:
+The first line of the file starts with `#` and holds tab-separated `key=value` pairs, covering all four blocks:
 
 | Key | Description |
 |---|---|
@@ -189,6 +194,25 @@ This means:
 - Anything no builder was seen for, such as a tree taken apart entirely between two polls, is written under `reclaimer_id` `0` with source `unknown` rather than spread over whoever happened to be nearby. Nothing is invented, and a large `unknown` share is a signal to trust the per-unit rows less.
 - Each second's rows add up exactly to that second's rise in `total_metal_reclaimed`/`total_energy_reclaimed`.
 - Enabled mid-game, the running totals start at whatever the team had already reclaimed, but only what is reclaimed from then on gets per-unit rows.
+
+### The `idle` block
+
+One row per stretch of time a builder or factory spent idle, sorted by start time. A builder is idle when it has no orders queued (for a factory: nothing in its build queue) and isn't working on anything. The second half matters for nano turrets and other builders that assist or repair on their own without an order; they are only idle when they have nothing to do.
+
+| Column | Description |
+|---|---|
+| `start_time` | Game time the builder was first seen idle (seconds) |
+| `duration` | How long it stayed idle (seconds). A stretch still running at export time is written up to the moment of export |
+| `unit_id` | The builder's unit ID; joins to the `build` block's unit and builder IDs |
+| `unit` | Translated builder name, e.g. `Construction Bot` |
+| `unit_def` | Internal builder name, e.g. `armck` |
+
+This is what separates the two kinds of gap between one of a builder's builds and its next: the part covered by an idle stretch is time it had no orders, and the rest is time it had orders but wasn't building yet, which is usually walking to the next build site.
+
+- Builders are polled five times a second, so a stretch's start and length are accurate to about 0.2 seconds.
+- A builder with a guard or patrol order is not idle, even when the factory it guards has nothing to build. Its guarding shows up as assist time in the `build` block instead.
+- Giving orders one at a time without shift-queueing leaves the builder idle between them, and that time is recorded. It is real idle time: the builder was waiting on the player.
+- A stretch ends when the builder dies or is given to another team. Air repair pads are left out; their build power only repairs aircraft.
 
 ## Author
 
