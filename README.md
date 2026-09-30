@@ -62,7 +62,7 @@ Any text after the command is saved as the build order's name in the files, e.g.
 Each file holds all four kinds of data as four blocks. They are four different shapes — one row per unit event, one row per game second, one row per second per reclaiming unit, one row per idle stretch — so joining them into a single table would mean denormalizing three of them into a grain they don't fit. Instead each block opens with a blank line, a `## <name>` marker and its own header row:
 
 ```
-# buildOrderTracker	version=10	player=...	map=...
+# buildOrderTracker	version=9	player=...	map=...
 
 ## build
 unit_name	built_by	start_time	build_duration	unit_def
@@ -178,7 +178,6 @@ One row per game second. Stored values and build power are a snapshot at the sta
 | `metal_received`, `energy_received` | Received from allies per second |
 | `metal_sent`, `energy_sent` | Sent to allies per second |
 | `build_power` | Build power actually in use: each builder's build speed times the fraction it applied, so builders that are walking, idle, or stalled count as zero or partial |
-| `build_power_total` | The build power there is: every finished builder's build speed, whether in use or not (air repair pads aside). Less `build_power`, what walking, idle and stalled builders left unused |
 | `total_metal_produced`, `total_energy_produced` | Cumulative income since game start |
 | `metal_average`, `energy_average` | Total produced divided by game seconds |
 | `army_value_built` | Cumulative metal cost of finished armed mobile units (excluding commanders) |

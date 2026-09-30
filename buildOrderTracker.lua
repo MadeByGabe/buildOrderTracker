@@ -11,8 +11,8 @@ function widget:GetInfo()
 end
 
 
--- Export format version, written into each file's "#" metadata line. 6 records build priority (see priorityMark), 7 adds the idle block, 8 units given between allies, 9 mexes and geos replaced by their upgrade, 10 the build power there is (build_power_total).
-local FORMAT_VERSION = 10
+-- Export format version, written into each file's "#" metadata line. 6 records build priority (see priorityMark), 7 adds the idle block, 8 units given between allies, 9 mexes and geos replaced by their upgrade.
+local FORMAT_VERSION = 9
 
 -- Localized Spring API
 local spGetSpectatingState = Spring.GetSpectatingState
@@ -174,7 +174,6 @@ local RESOURCE_COLUMNS = {
 	"metal_received", "energy_received", -- from allies
 	"metal_sent", "energy_sent", -- to allies
 	"build_power", -- build power actually in use
-	"build_power_total", -- the build power of every finished builder, in use or not
 	"total_metal_produced", "total_energy_produced",
 	"metal_average", "energy_average",
 	"army_value_built", "defence_value_built",
@@ -279,23 +278,19 @@ local function metadataLine(teamID, data, buildName)
 end
 
 
--- Build power actually in use, and the build power there is: GetUnitCurrentBuildPower is the fraction (0..1) of a builder's build speed it applied this frame, so a commander walking to its next mex, or a factory with nothing it can afford, counts as idle - but as there, among every finished builder's. Air repair pads aren't builders (see tracksIdle): their build power only repairs aircraft.
-local function calculateBuildPower(teamID)
-	local inUse, total = 0, 0
+-- Build power actually in use: GetUnitCurrentBuildPower is the fraction (0..1) of a builder's build speed it applied this frame, so a commander walking to its next mex, or a factory with nothing it can afford, counts as idle
+local function calculateBuildPowerInUse(teamID)
+	local total = 0
 	for _, unitID in ipairs(spGetTeamUnits(teamID)) do
-		local unitDefID = spGetUnitDefID(unitID)
-		local speed = builderSpeed[unitDefID]
+		local speed = builderSpeed[spGetUnitDefID(unitID)]
 		if speed then
 			local fraction = spGetUnitCurrentBuildPower(unitID)
 			if fraction and fraction > 0 then
-				inUse = inUse + speed * fraction
-			end
-			if tracksIdle[unitDefID] and not spGetUnitIsBeingBuilt(unitID) then
-				total = total + speed
+				total = total + speed * fraction
 			end
 		end
 	end
-	return inUse, total
+	return total
 end
 
 
@@ -770,7 +765,6 @@ local function sampleSecond(gs)
 
 		data.totalMetalProduced = data.totalMetalProduced + mIncome
 		data.totalEnergyProduced = data.totalEnergyProduced + eIncome
-		local buildPowerInUse, buildPowerTotal = calculateBuildPower(teamID)
 
 		-- same order as RESOURCE_COLUMNS
 		local rows = data.resourceRows
@@ -783,7 +777,7 @@ local function sampleSecond(gs)
 			mExcess or 0, eExcess or 0,
 			mReceived or 0, eReceived or 0,
 			mSent or 0, eSent or 0,
-			buildPowerInUse, buildPowerTotal,
+			calculateBuildPowerInUse(teamID),
 			data.totalMetalProduced, data.totalEnergyProduced,
 			gs > 0 and data.totalMetalProduced / gs or 0, gs > 0 and data.totalEnergyProduced / gs or 0,
 			data.armyValueBuilt, data.defenceValueBuilt,
