@@ -7,6 +7,7 @@ A [Beyond All Reason](https://www.beyondallreason.info/) widget that records bui
 - Tracks every unit completion: what was built, which builder built it, when, and how long construction took
 - Tracks which other builders assisted each build (guarding cons, nano turrets, the commander helping), and for how long
 - Tracks units given to or received from a teammate
+- Tracks metal extractors and geothermal plants replaced by their upgrade, whose metal cost the game gives back
 - Tracks when players reclaim their own finished units (e.g. wind turbines, to make room), with the reclaimer and how long it took
 - Tracks feature reclaim (wrecks, rocks, trees) per second **and per reclaiming unit**, so you can tell what a given constructor actually brought in and when
 - Records per-second snapshots of metal/energy income, expense, pull, excess, storage, and transfers between allies
@@ -61,7 +62,7 @@ Any text after the command is saved as the build order's name in the files, e.g.
 Each file holds all four kinds of data as four blocks. They are four different shapes — one row per unit event, one row per game second, one row per second per reclaiming unit, one row per idle stretch — so joining them into a single table would mean denormalizing three of them into a grain they don't fit. Instead each block opens with a blank line, a `## <name>` marker and its own header row:
 
 ```
-# buildOrderTracker	version=7	player=...	map=...
+# buildOrderTracker	version=9	player=...	map=...
 
 ## build
 unit_name	built_by	start_time	build_duration	unit_def
@@ -118,14 +119,14 @@ The first line of the file starts with `#` and holds tab-separated `key=value` p
 
 ### The `build` block
 
-One row per finished unit, plus one per reclaimed unit and one per unit given to or received from a teammate, sorted by start time.
+One row per finished unit, plus one per reclaimed unit, one per unit given to or received from a teammate and one per mex or geo replaced by its upgrade, sorted by start time.
 
 | Column | Description |
 |---|---|
 | `unit_name` | Translated unit name followed by unit ID, e.g. `Wind Turbine (1234)`. MEXes include the extraction rate (`Metal Extractor:2.40 (1234)`). Reclaimed units start with `-` (`-Wind Turbine (1234)`) |
-| `built_by` | Builder name and ID; for reclaims, the unit that reclaimed it; `received` or `sent` for a unit that changed hands (see below). Empty if unknown. Assistants follow after a `:` (see below) |
-| `start_time` | Game time when construction started, when the reclaim started, or when the unit changed hands (seconds). If a build's start wasn't seen, the time it finished instead |
-| `build_duration` | How long construction took, or how long the reclaim took (seconds). Empty if the start wasn't seen, and for units that changed hands |
+| `built_by` | Builder name and ID; for reclaims, the unit that reclaimed it; `received` or `sent` for a unit that changed hands, `upgraded by` its upgrade for a replaced mex or geo (see below). Empty if unknown. Assistants follow after a `:` (see below) |
+| `start_time` | Game time when construction started, when the reclaim started, or when the unit changed hands or was replaced (seconds). If a build's start wasn't seen, the time it finished instead |
+| `build_duration` | How long construction took, or how long the reclaim took (seconds). Empty if the start wasn't seen, for units that changed hands, and for replaced ones |
 | `unit_def` | Internal unit name (e.g. `armwin`), the same in every game language |
 
 #### Units given between teammates
@@ -137,6 +138,16 @@ Advanced Construction Bot (1234)	received	612.40		corack
 ```
 
 The unit ID stays the same across the transfer, so it joins to the row where the unit was built, in whichever player's file that is. When both players are tracked, each file gets its side of the transfer. A player leaving the game hands all their units to a teammate, which shows up as a burst of `received` rows. Units taken by an enemy (captured) are not logged.
+
+#### Upgrades
+
+A metal extractor or geothermal plant with another of its kind finished on top of it — an advanced mex on a T1 mex, an advanced geo on a T1 geo — is taken away by the game the moment the new one is finished, and its whole metal cost comes back to the team, as if it had been reclaimed (the game's *Mex Upgrade Reclaimer* and *Geo Upgrade Reclaimer*). The old one then gets a row with `upgraded by` and the new one in `built_by`, at that moment:
+
+```
+Metal Extractor:2.40 (1234)	upgraded by Advanced Metal Extractor (5678)	412.20		armmex
+```
+
+The new one's own row finishes at the same time. The metal coming back counts as production, so it shows in `metal_income` and the running totals of that second, like a reclaimed building's.
 
 #### Assistants
 

@@ -11,8 +11,8 @@ function widget:GetInfo()
 end
 
 
--- Export format version, written into each file's "#" metadata line. 6 records build priority (see priorityMark), 7 adds the idle block, 8 units given between allies.
-local FORMAT_VERSION = 8
+-- Export format version, written into each file's "#" metadata line. 6 records build priority (see priorityMark), 7 adds the idle block, 8 units given between allies, 9 mexes and geos replaced by their upgrade.
+local FORMAT_VERSION = 9
 
 -- Localized Spring API
 local spGetSpectatingState = Spring.GetSpectatingState
@@ -33,6 +33,8 @@ local spGetTeamResources = Spring.GetTeamResources
 local spGetTeamRulesParam = Spring.GetTeamRulesParam
 local spGetTeamUnits = Spring.GetTeamUnits
 local spGetUnitDefID = Spring.GetUnitDefID
+local spGetUnitPosition = Spring.GetUnitPosition
+local spGetUnitsInCylinder = Spring.GetUnitsInCylinder
 local spGetUnitIsBeingBuilt = Spring.GetUnitIsBeingBuilt
 local spGetUnitCurrentBuildPower = Spring.GetUnitCurrentBuildPower
 local spGetUnitMetalExtraction = Spring.GetUnitMetalExtraction
@@ -134,6 +136,7 @@ local gameIDHex -- from the GameID callin; missed if the widget is enabled after
 -- Per-unitDef lookups, built once
 local builderSpeed = {} -- unitDefID -> buildSpeed, for anything that can build
 local isMex = {} -- unitDefID -> true for metal extractors (incl. Exploiters, Twilight, naval/T1.5/T2 variants)
+local upgradeKind = {} -- unitDefID -> "mex" or "geo": what the game's upgrade reclaimer gadgets replace with another of the same kind built on top (see upgradeOnTop)
 local isFactory = {} -- unitDefID -> true for factories, whose build queue is separate from their command queue
 local tracksIdle = {} -- unitDefID -> true for the builders the idle block covers: every one but air repair pads, which have build power only to repair aircraft
 for unitDefID, unitDef in pairs(UnitDefs) do
@@ -146,6 +149,9 @@ for unitDefID, unitDef in pairs(UnitDefs) do
 	end
 	if (unitDef.extractsMetal or 0) > 0 then
 		isMex[unitDefID] = true
+		upgradeKind[unitDefID] = "mex"
+	elseif unitDef.customParams.geothermal then
+		upgradeKind[unitDefID] = "geo"
 	end
 end
 
@@ -815,12 +821,56 @@ function widget:GameFrame(frame)
 end
 
 
+-- A unit's name in the build block, with a mex's extraction rate appended: "Metal Extractor:2.40"
+local function unitDisplayName(unitID, unitDefID, unitDef)
+	if isMex[unitDefID] then
+		return unitDef.translatedHumanName .. ":" .. format("%.2f", spGetUnitMetalExtraction(unitID) or 0)
+	end
+	return unitDef.translatedHumanName
+end
+
+
+-- The finished mex or geo standing where one just went: its upgrade. The upgrade reclaimer gadgets (unit_mex_upgrade_reclaimer, unit_geo_upgrade_reclaimer) destroy a mex or geo the moment another of its kind is finished on top of it, and give its metal cost back - and that happens inside the new one's UnitFinished, so this sees the old one go before the new one's own row is logged, at the same game time. A nanoframe on top (an upgrade still being built) doesn't count: an enemy can destroy what it stands on.
+local function upgradeOnTop(unitID, unitDefID)
+	local kind = upgradeKind[unitDefID]
+	local x, _, z = spGetUnitPosition(unitID)
+	if not kind or not x then
+		return nil
+	end
+	for _, otherID in ipairs(spGetUnitsInCylinder(x, z, 10)) do
+		local otherDefID = spGetUnitDefID(otherID)
+		if otherID ~= unitID and upgradeKind[otherDefID] == kind and not spGetUnitIsBeingBuilt(otherID) then
+			return otherID, otherDefID
+		end
+	end
+	return nil
+end
+
+
 function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerDefID, attackerTeam, weaponDefID)
 	buildStartTimes[unitID] = nil
 	assistTimes[unitID] = nil
 
 	local tracking = reclaimTracking[unitID]
 	reclaimTracking[unitID] = nil
+
+	-- A mex or geo replaced by its upgrade is a row of its own, "upgraded by" the one on top, at the moment it went (its metal came back then). Killed by the gadget, so a death with another cause - an enemy's weapon - is left alone.
+	local killedOtherwise = weaponDefID and (OTHER_CAUSE[weaponDefID] or (WeaponDefs[weaponDefID] and not RECLAIM_CAUSE[weaponDefID]))
+	if playerData[unitTeam] and not killedOtherwise then
+		local upgradeID, upgradeDefID = upgradeOnTop(unitID, unitDefID)
+		local unitDef = UnitDefs[unitDefID]
+		if upgradeID and unitDef then
+			local events = playerData[unitTeam].buildEvents
+			events[#events + 1] = {
+				unitName = unitDisplayName(unitID, unitDefID, unitDef),
+				unitDefName = unitDef.name,
+				unitID = unitID,
+				builderName = "upgraded by " .. UnitDefs[upgradeDefID].translatedHumanName .. " (" .. upgradeID .. ")",
+				startTime = spGetGameSeconds(),
+			}
+			return
+		end
+	end
 
 	-- Log a reclaim only if a tracked builder was seen reclaiming this unit right up until it disappeared (within the stale window), which is also what names the reclaimer - and only if the engine's own cause of death agrees: something an enemy shells first, or whose owner self-destructs it, was not reclaimed. A death the engine names no cause for falls back to the stale window alone.
 	local gameTime = spGetGameSeconds()
@@ -854,15 +904,6 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerD
 		duration = gameTime - tracking.startTime,
 		reclaimed = true,
 	}
-end
-
-
--- A unit's name in the build block, with a mex's extraction rate appended: "Metal Extractor:2.40"
-local function unitDisplayName(unitID, unitDefID, unitDef)
-	if isMex[unitDefID] then
-		return unitDef.translatedHumanName .. ":" .. format("%.2f", spGetUnitMetalExtraction(unitID) or 0)
-	end
-	return unitDef.translatedHumanName
 end
 
 
