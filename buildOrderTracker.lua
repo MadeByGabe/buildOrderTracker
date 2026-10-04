@@ -11,8 +11,8 @@ function widget:GetInfo()
 end
 
 
--- Export format version, written into each file's "#" metadata line. 6 records build priority (see priorityMark), 7 adds the idle block, 8 units given between allies, 9 mexes and geos replaced by their upgrade.
-local FORMAT_VERSION = 9
+-- Export format version, written into each file's "#" metadata line. 6 records build priority (see priorityMark), 7 adds the idle block, 8 units given between allies, 9 mexes and geos replaced by their upgrade, 10 the player's team and a file per team (see exportTeam).
+local FORMAT_VERSION = 10
 
 -- Localized Spring API
 local spGetSpectatingState = Spring.GetSpectatingState
@@ -251,16 +251,15 @@ local function teamColor(teamID)
 end
 
 
--- First line of every export: "#" plus tab-separated key=value pairs, so the files carry their own context (the filename timestamp is when the widget loaded, not when the game was played)
-local function metadataLine(teamID, data, buildName)
+-- First line of every export: "#" plus tab-separated key=value pairs, so the files carry their own context (the filename timestamp is when the widget loaded, not when the game was played). whose: the fields saying whose build it is, a player's or a team's.
+local function metadataLine(whose, buildName)
 	local gameID = getGameID()
 	local played = gamePlayedTime(gameID)
-	local fields = {
-		"# buildOrderTracker",
-		"version=" .. FORMAT_VERSION,
-		"player=" .. data.name,
-		-- so a chart of this build can draw it in the colour it had in game
-		"color=" .. teamColor(teamID),
+	local fields = { "# buildOrderTracker", "version=" .. FORMAT_VERSION }
+	for _, field in ipairs(whose) do
+		fields[#fields + 1] = field
+	end
+	for _, field in ipairs({
 		"map=" .. (Game.mapName or "?"),
 		"game=" .. (Game.gameName or "?") .. " " .. (Game.gameVersion or ""),
 		"gameID=" .. tostring(gameID or "?"),
@@ -270,7 +269,9 @@ local function metadataLine(teamID, data, buildName)
 		"windMin=" .. (Game.windMin and format("%.2f", Game.windMin) or "?"),
 		"windMax=" .. (Game.windMax and format("%.2f", Game.windMax) or "?"),
 		"tidal=" .. (Game.tidal and format("%.2f", Game.tidal) or "?"),
-	}
+	}) do
+		fields[#fields + 1] = field
+	end
 	if buildName ~= "" then
 		fields[#fields + 1] = "name=" .. buildName
 	end
@@ -339,6 +340,13 @@ local function closeIdleStretch(unitID, endTime)
 	if data then
 		data.idleRows[#data.idleRows + 1] = idleRow(unitID, stretch, endTime)
 	end
+end
+
+
+-- Whether two tracked teams are players of one team (one ally team), which a team's file has as one
+local function sameTeam(teamA, teamB)
+	local a, b = playerData[teamA], playerData[teamB]
+	return a ~= nil and b ~= nil and a.allyTeam == b.allyTeam
 end
 
 
@@ -419,14 +427,15 @@ local function trackWorkerTasks(gameTime)
 						end
 					elseif spValidUnitID(targetID) and not targetBeingBuilt then
 						local targetTeam = spGetUnitTeam(targetID)
-						-- Only treat unit reclaim as a "build reclaim" for the team that owns both the reclaimer and the target. Enemy reclaim is a loss for the victim team.
-						if targetTeam and targetTeam == teamID and playerData[targetTeam] then
+						-- A "build reclaim" is a player taking apart their own building, or (in their team's file only) a teammate's. Enemy reclaim is a loss for the victim team.
+						if targetTeam and (targetTeam == teamID or sameTeam(targetTeam, teamID)) then
 							local tracking = reclaimTracking[targetID]
 							if not tracking or (gameTime - tracking.lastSeen) > RECLAIM_STALE_SECONDS then
 								reclaimTracking[targetID] = {
 									startTime = gameTime,
 									reclaimerName = UnitDefs[unitDefID].translatedHumanName,
 									reclaimerID = unitID,
+									reclaimerTeam = teamID,
 									lastSeen = gameTime,
 								}
 							else
@@ -456,8 +465,8 @@ local function isDefenceUnit(unitDef)
 end
 
 
--- The assistants of a finished unit, as the suffix of its built_by cell: "11501,27409-=2.1" — a builder's unitID, a "-" if it helped on Low Prio, and the seconds it helped unless it helped (nearly) the whole build. nil when nobody assisted.
-local function assistCell(times, duration)
+-- The assistants of a finished unit, as the suffix of its built_by cell: "11501,27409-=2.1" — a builder's unitID, a "-" if it helped on Low Prio, and the seconds it helped unless it helped (nearly) the whole build. nil when nobody assisted. idOf writes a unitID (see exportData).
+local function assistCell(times, duration, idOf)
 	if not times then
 		return nil
 	end
@@ -476,12 +485,29 @@ local function assistCell(times, duration)
 		local seconds = tally.seconds
 		local mark = priorityMark(tally)
 		if slack and seconds >= duration - slack then
-			cells[i] = builderID .. mark
+			cells[i] = idOf(builderID) .. mark
 		else
-			cells[i] = builderID .. mark .. "=" .. format("%.1f", seconds)
+			cells[i] = idOf(builderID) .. mark .. "=" .. format("%.1f", seconds)
 		end
 	end
 	return concat(cells, ",")
+end
+
+
+-- An event's built_by cell: the builder's name and ID and its priority mark, then its assistants after a ":" - "Bot Lab (2436):11501,27409=2.1". Just the name where there is no ID ("received"); empty when the builder is unknown.
+local function builtByCell(event, idOf)
+	if not event.builderName then
+		return ""
+	end
+	local cell = event.builderName
+	if event.builderID then
+		cell = cell .. " (" .. idOf(event.builderID) .. ")" .. (event.mark or "")
+	end
+	local assists = assistCell(event.assists, event.duration, idOf)
+	if assists then
+		cell = cell .. ":" .. assists
+	end
+	return cell
 end
 
 
@@ -508,13 +534,13 @@ end
 
 
 -- Events are written in the order they were started (see eventsByStartTime), which is how a build order reads.
-local function writeBuildSection(file, events)
+local function writeBuildSection(file, events, idOf)
 	beginSection(file, "build", BUILD_COLUMNS)
 	for _, entry in ipairs(eventsByStartTime(events)) do
 		local event = entry.event
 		local prefix = event.reclaimed and "-" or ""
-		local unitNameWithID = prefix .. event.unitName .. " (" .. (event.unitID or "?") .. ")"
-		local builder = event.builderName or ""
+		local unitNameWithID = prefix .. event.unitName .. " (" .. (event.unitID and idOf(event.unitID) or "?") .. ")"
+		local builder = builtByCell(event, idOf)
 		local duration = event.duration and format("%.2f", event.duration) or ""
 		file:write(unitNameWithID .. "\t" .. builder .. "\t" .. format("%.2f", event.startTime) .. "\t" .. duration .. "\t" .. (event.unitDefName or "") .. "\n")
 	end
@@ -535,17 +561,17 @@ end
 
 
 -- See writeReclaimRows. reclaimer_id joins to the builder's unitID in the build block, so a reclaimer can be followed back to when and by what it was built.
-local function writeReclaimSection(file, rows)
+local function writeReclaimSection(file, rows, idOf)
 	beginSection(file, "reclaim", RECLAIM_COLUMNS)
 	for _, row in ipairs(rows) do
-		file:write(format("%d\t%d\t%s\t%s\t%s\t%.2f\t%.2f\n",
-			row[1], row[2], row[3], row[4], row[5], row[6], row[7]))
+		file:write(format("%d\t%s\t%s\t%s\t%s\t%.2f\t%.2f\n",
+			row[1], idOf(row[2]), row[3], row[4], row[5], row[6], row[7]))
 	end
 end
 
 
--- Stretches are logged when they end, and are written in the order they started; one still running at export time is written up to now.
-local function writeIdleSection(file, teamID, rows)
+-- Stretches are logged when they end, and are written in the order they started; one still running at export time is written up to now. teams: the set of teamIDs whose stretches they are.
+local function writeIdleSection(file, teams, rows, idOf)
 	beginSection(file, "idle", IDLE_COLUMNS)
 	local sorted = {}
 	for i, row in ipairs(rows) do
@@ -553,7 +579,7 @@ local function writeIdleSection(file, teamID, rows)
 	end
 	local now = spGetGameSeconds()
 	for unitID, stretch in pairs(idleStretches) do
-		if stretch.teamID == teamID then
+		if teams[stretch.teamID] then
 			sorted[#sorted + 1] = idleRow(unitID, stretch, now)
 		end
 	end
@@ -564,31 +590,188 @@ local function writeIdleSection(file, teamID, rows)
 		return a[3] < b[3]
 	end)
 	for _, row in ipairs(sorted) do
-		file:write(format("%.2f\t%.2f\t%d\t%s\t%s\n", row[1], row[2], row[3], row[4], row[5]))
+		file:write(format("%.2f\t%.2f\t%s\t%s\t%s\n", row[1], row[2], idOf(row[3]), row[4], row[5]))
 	end
 end
 
 
--- One file per tracked player. All four blocks are written even when a block has no rows - a game where nothing was reclaimed still gets an empty reclaim block - so every file has the same shape and a reader never has to tell a missing block from an empty one.
+-- One export file, its four blocks from what: { buildEvents, resourceRows, reclaimRows, idleRows, teams = the set of teamIDs whose idle stretches go in, idOf = how a unitID is written }. All four blocks are written even when a block has no rows - a game where nothing was reclaimed still gets an empty reclaim block - so every file has the same shape and a reader never has to tell a missing block from an empty one.
+local function writeExport(filename, whose, buildName, what)
+	local file = ioOpen(filename, "w")
+	if not file then
+		return false
+	end
+	file:write(metadataLine(whose, buildName))
+	writeBuildSection(file, what.buildEvents, what.idOf)
+	writeResourceSection(file, what.resourceRows)
+	writeReclaimSection(file, what.reclaimRows, what.idOf)
+	writeIdleSection(file, what.teams, what.idleRows, what.idOf)
+	file:close()
+	spEcho("BuildOrderTracker: Exported " .. filename:match("[^/]*$") .. " - " .. #what.buildEvents .. " build events, "
+		.. #what.resourceRows .. " data points, " .. #what.reclaimRows .. " reclaim rows, " .. #what.idleRows .. " idle stretches")
+	return true
+end
+
+
+local function plainID(unitID)
+	return tostring(unitID)
+end
+
+
+-- The tracked players of each team, by ally team, each list in teamID order
+local function playersByTeam()
+	local teams = {}
+	for teamID, data in pairs(playerData) do
+		teams[data.allyTeam] = teams[data.allyTeam] or {}
+		local members = teams[data.allyTeam]
+		members[#members + 1] = teamID
+	end
+	for _, members in pairs(teams) do
+		table.sort(members)
+	end
+	return teams
+end
+
+
+-- The metadata fields naming a team: its number as the lobby shows it (ally team 0 is Team 1), and its tracked players
+local function teamFields(allyTeam, members)
+	local names = {}
+	for i, teamID in ipairs(members) do
+		names[i] = playerData[teamID].name
+	end
+	return { "team=" .. (allyTeam + 1), "players=" .. concat(names, ",") }
+end
+
+
+local RESOURCE_INDEX = {} -- resource column name -> its place in a row
+for i, name in ipairs(RESOURCE_COLUMNS) do
+	RESOURCE_INDEX[name] = i
+end
+
+
+-- A team's resource rows: its players' summed per second, as one pool, the wind the first one's. What the players shared with each other is no flow in or out of the team, so it cancels out: received and sent keep only what came from or went to anyone outside it, which is nothing when every ally is a teammate.
+local function teamResourceRows(members)
+	local bySecond, seconds = {}, {}
+	for _, teamID in ipairs(members) do
+		for _, row in ipairs(playerData[teamID].resourceRows) do
+			local sum = bySecond[row[1]]
+			if not sum then
+				sum = { row[1], row[2] }
+				for i = 3, #RESOURCE_COLUMNS do
+					sum[i] = 0
+				end
+				bySecond[row[1]] = sum
+				seconds[#seconds + 1] = row[1]
+			end
+			for i = 3, #RESOURCE_COLUMNS do
+				sum[i] = sum[i] + (row[i] or 0)
+			end
+		end
+	end
+	table.sort(seconds)
+	local rows = {}
+	for i, second in ipairs(seconds) do
+		local row = bySecond[second]
+		for _, resource in ipairs({ "metal", "energy" }) do
+			local received, sent = RESOURCE_INDEX[resource .. "_received"], RESOURCE_INDEX[resource .. "_sent"]
+			local net = row[received] - row[sent]
+			row[received], row[sent] = net > 0 and net or 0, net < 0 and -net or 0
+		end
+		rows[i] = row
+	end
+	return rows
+end
+
+
+-- In a team's file each starting commander goes by its player's name in place of its unitID - "Armada Commander (Alice)" - wherever the ID is written, so a timeline's lanes say whose they are. A word, as an ID is: letters, digits and "_".
+local function commanderIDs(members)
+	local named, taken = {}, {}
+	for _, teamID in ipairs(members) do
+		local data = playerData[teamID]
+		local base = data.name:gsub("[^%w_]", "_")
+		for _, event in ipairs(data.buildEvents) do
+			if event.startingCommander and not named[event.unitID] then
+				local name, n = base, 1
+				while taken[name] do
+					n = n + 1
+					name = base .. "_" .. n
+				end
+				taken[name] = true
+				named[event.unitID] = name
+			end
+		end
+	end
+	return function(unitID)
+		return named[unitID] or tostring(unitID)
+	end
+end
+
+
+-- A team of several players as if it were one: their build, reclaim and idle rows together, their resources summed (teamResourceRows). That's what a team game is - the players share resources and pass units around, and a player's file is full of it - so the team's file is the one that reads as a build. A unit passed between two of its players is the team's throughout, so those rows go; a building one of them took apart of another's is the team's own reclaim, so that row stays.
+local function exportTeam(allyTeam, members, buildName)
+	local what = { buildEvents = {}, reclaimRows = {}, idleRows = {}, teams = {}, idOf = commanderIDs(members) }
+	local reclaimRows = {}
+	for _, teamID in ipairs(members) do
+		local data = playerData[teamID]
+		what.teams[teamID] = true
+		for _, event in ipairs(data.buildEvents) do
+			if not (event.otherTeam and sameTeam(teamID, event.otherTeam)) then
+				what.buildEvents[#what.buildEvents + 1] = event
+			end
+		end
+		for _, row in ipairs(data.reclaimRows) do
+			reclaimRows[#reclaimRows + 1] = { row = row, index = #reclaimRows + 1 }
+		end
+		for _, row in ipairs(data.idleRows) do
+			what.idleRows[#what.idleRows + 1] = row
+		end
+	end
+	table.sort(reclaimRows, function(a, b)
+		if a.row[1] ~= b.row[1] then
+			return a.row[1] < b.row[1]
+		end
+		return a.index < b.index
+	end)
+	for i, entry in ipairs(reclaimRows) do
+		what.reclaimRows[i] = entry.row
+	end
+	what.resourceRows = teamResourceRows(members)
+	return writeExport(generateFilename("buildorder_team" .. (allyTeam + 1), "tsv"), teamFields(allyTeam, members), buildName, what)
+end
+
+
+-- One file per tracked player, and one per team of more than one player (exportTeam).
 local function exportData(buildName)
 	ensureExportDir()
 	local filesCreated = 0
 
-	for teamID, data in pairs(playerData) do
-		if #data.buildEvents > 0 or #data.resourceRows > 0 then
-			local filename = generateFilename("buildorder_" .. data.name, "tsv")
-			local file = ioOpen(filename, "w")
-			if file then
-				file:write(metadataLine(teamID, data, buildName))
-				writeBuildSection(file, data.buildEvents)
-				writeResourceSection(file, data.resourceRows)
-				writeReclaimSection(file, data.reclaimRows)
-				writeIdleSection(file, teamID, data.idleRows)
-				file:close()
-				filesCreated = filesCreated + 1
-				spEcho("BuildOrderTracker: Exported " .. data.name .. " - " .. #data.buildEvents .. " build events, "
-					.. #data.resourceRows .. " data points, " .. #data.reclaimRows .. " reclaim rows, " .. #data.idleRows .. " idle stretches")
+	for allyTeam, members in pairs(playersByTeam()) do
+		for _, teamID in ipairs(members) do
+			local data = playerData[teamID]
+			if #data.buildEvents > 0 or #data.resourceRows > 0 then
+				-- a teammate's building this player took apart is in the team's file only
+				local events = {}
+				for _, event in ipairs(data.buildEvents) do
+					if not event.teamOnly then
+						events[#events + 1] = event
+					end
+				end
+				local whose = {
+					"player=" .. data.name,
+					-- so a chart of this build can draw it in the colour it had in game
+					"color=" .. teamColor(teamID),
+				}
+				for _, field in ipairs(teamFields(allyTeam, members)) do
+					whose[#whose + 1] = field
+				end
+				local what = { buildEvents = events, resourceRows = data.resourceRows, reclaimRows = data.reclaimRows, idleRows = data.idleRows, teams = { [teamID] = true }, idOf = plainID }
+				if writeExport(generateFilename("buildorder_" .. data.name, "tsv"), whose, buildName, what) then
+					filesCreated = filesCreated + 1
+				end
 			end
+		end
+		if #members > 1 and exportTeam(allyTeam, members, buildName) then
+			filesCreated = filesCreated + 1
 		end
 	end
 
@@ -655,8 +838,11 @@ end
 
 
 local function trackTeam(teamID, name)
+	local _, _, _, _, _, allyTeam = spGetTeamInfo(teamID, false)
 	playerData[teamID] = {
 		name = (name or "team" .. teamID):gsub("[^%w_%-]", "_"),
+		-- the team the player is on, which the game calls an ally team: its players' files carry it, and it gets a file of its own (see exportTeam)
+		allyTeam = allyTeam or teamID,
 		buildEvents = {},
 		resourceRows = {},
 		reclaimRows = {},
@@ -865,7 +1051,8 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerD
 				unitName = unitDisplayName(unitID, unitDefID, unitDef),
 				unitDefName = unitDef.name,
 				unitID = unitID,
-				builderName = "upgraded by " .. UnitDefs[upgradeDefID].translatedHumanName .. " (" .. upgradeID .. ")",
+				builderName = "upgraded by " .. UnitDefs[upgradeDefID].translatedHumanName,
+				builderID = upgradeID,
 				startTime = spGetGameSeconds(),
 			}
 			return
@@ -887,11 +1074,11 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerD
 	local unitDef = unitDefID and UnitDefs[unitDefID]
 	local unitName = unitDef and unitDef.translatedHumanName or "unknown"
 
-	local reclaimerStr = nil
+	local reclaimerName, reclaimerID = nil, nil
 	if tracking.reclaimerName then
-		reclaimerStr = tracking.reclaimerName .. " (" .. tracking.reclaimerID .. ")"
+		reclaimerName, reclaimerID = tracking.reclaimerName, tracking.reclaimerID
 	elseif attackerID and attackerDefID and UnitDefs[attackerDefID] then
-		reclaimerStr = UnitDefs[attackerDefID].translatedHumanName .. " (" .. attackerID .. ")"
+		reclaimerName, reclaimerID = UnitDefs[attackerDefID].translatedHumanName, attackerID
 	end
 
 	local events = playerData[unitTeam].buildEvents
@@ -899,10 +1086,13 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerD
 		unitName = unitName,
 		unitDefName = unitDef and unitDef.name,
 		unitID = unitID,
-		builderName = reclaimerStr,
+		builderName = reclaimerName,
+		builderID = reclaimerID,
 		startTime = tracking.startTime,
 		duration = gameTime - tracking.startTime,
 		reclaimed = true,
+		-- a teammate took it apart: the team's own reclaim, but for its owner a building lost like any other
+		teamOnly = tracking.reclaimerTeam ~= unitTeam or nil,
 	}
 end
 
@@ -924,6 +1114,8 @@ function widget:UnitGiven(unitID, unitDefID, newTeam, oldTeam)
 				unitID = unitID,
 				builderName = direction,
 				startTime = gameTime,
+				-- the other side: a teammate's, and the team's file has no transfer to write
+				otherTeam = teamID == newTeam and oldTeam or newTeam,
 			}
 		end
 	end
@@ -955,18 +1147,8 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
 	local builderID = buildInfo and buildInfo.builderID or nil
 	buildStartTimes[unitID] = nil
 
-	local builderStr = nil
-	if builderName and builderID then
-		builderStr = builderName .. " (" .. builderID .. ")" .. priorityMark(buildInfo)
-	elseif builderName then
-		builderStr = builderName
-	end
-	local duration = startTime and (gameTime - startTime) or nil
-	local assists = assistCell(assistTimes[unitID], duration)
+	local assists = assistTimes[unitID]
 	assistTimes[unitID] = nil
-	if builderStr and assists then
-		builderStr = builderStr .. ":" .. assists
-	end
 
 	if playerData[unitTeam] then
 		local events = playerData[unitTeam].buildEvents
@@ -974,10 +1156,16 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
 			unitName = unitName,
 			unitDefName = unitDef.name,
 			unitID = unitID,
-			builderName = builderStr,
+			-- written out by builtByCell
+			builderName = builderName,
+			builderID = builderName and builderID,
+			mark = builderName and builderID and priorityMark(buildInfo) or nil,
+			assists = builderName and assists or nil,
 			-- If the start wasn't seen, fall back to the finish time with an unknown duration
 			startTime = startTime or gameTime,
-			duration = duration,
+			duration = startTime and (gameTime - startTime) or nil,
+			-- the commander the player started with, which nobody built: named for its player in the team's file (see commanderIDs)
+			startingCommander = not builderID and unitDef.customParams.iscommander and true or nil,
 		}
 	end
 end

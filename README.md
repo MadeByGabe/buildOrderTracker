@@ -19,7 +19,7 @@ A [Beyond All Reason](https://www.beyondallreason.info/) widget that records bui
 - Appends extraction rate to MEX unit names (e.g. `Metal Extractor:2.40`)
 - Records when the game was played, and lets you name the build order when exporting
 - Provides a `/export_bo` chat command to write files at any point during or after the match
-- Exports one TSV per player, holding the build, resource, reclaim and idle data as four labelled blocks
+- Exports one TSV per player, holding the build, resource, reclaim and idle data as four labelled blocks, and one per team of several players, as if the team were one player
 
 ## Installation
 
@@ -53,6 +53,12 @@ One file per tracked player, named using the player name, map name (shortened to
 buildorder_PlayerName_some_map_name_20260415_183000.tsv
 ```
 
+In a team game, each team of more than one player also gets a file of its own, named for its number as the lobby shows it (see [Team files](#team-files)):
+
+```
+buildorder_team1_some_map_name_20260415_183000.tsv
+```
+
 You can run `/export_bo` multiple times; each call overwrites the files for that session.
 
 Any text after the command is saved as the build order's name in the files, e.g. `/export_bo commander tempo build`.
@@ -62,7 +68,7 @@ Any text after the command is saved as the build order's name in the files, e.g.
 Each file holds all four kinds of data as four blocks. They are four different shapes — one row per unit event, one row per game second, one row per second per reclaiming unit, one row per idle stretch — so joining them into a single table would mean denormalizing three of them into a grain they don't fit. Instead each block opens with a blank line, a `## <name>` marker and its own header row:
 
 ```
-# buildOrderTracker	version=9	player=...	map=...
+# buildOrderTracker	version=10	player=...	team=1	map=...
 
 ## build
 unit_name	built_by	start_time	build_duration	unit_def
@@ -106,8 +112,10 @@ The first line of the file starts with `#` and holds tab-separated `key=value` p
 | Key | Description |
 |---|---|
 | `version` | Export format version |
-| `player` | Player name |
-| `color` | The team's colour as `#rrggbb`, as the exporting client shows it; `?` if unavailable |
+| `player` | Player name; omitted in a team file |
+| `color` | The player's colour as `#rrggbb`, as the exporting client shows it; `?` if unavailable. Omitted in a team file |
+| `team` | The player's team, numbered as in the lobby (`1` is Team 1) |
+| `players` | The team's tracked players, comma-separated, e.g. `Alice,Bob,Carol`; just the player in a game without teammates |
 | `map` | Map name |
 | `game` | Game name and version |
 | `gameID` | Engine game ID |
@@ -137,7 +145,7 @@ A unit a teammate gave this player, or this player gave a teammate, is a row wit
 Advanced Construction Bot (1234)	received	612.40		corack
 ```
 
-The unit ID stays the same across the transfer, so it joins to the row where the unit was built, in whichever player's file that is. When both players are tracked, each file gets its side of the transfer. A player leaving the game hands all their units to a teammate, which shows up as a burst of `received` rows. Units taken by an enemy (captured) are not logged.
+The unit ID stays the same across the transfer, so it joins to the row where the unit was built, in whichever player's file that is. When both players are tracked, each file gets its side of the transfer, and their team's file neither (see [Team files](#team-files)). A player leaving the game hands all their units to a teammate, which shows up as a burst of `received` rows. Units taken by an enemy (captured) are not logged.
 
 #### Upgrades
 
@@ -235,6 +243,17 @@ This is what separates the two kinds of gap between one of a builder's builds an
 - A builder with a guard or patrol order is not idle, even when the factory it guards has nothing to build. Its guarding shows up as assist time in the `build` block instead.
 - Giving orders one at a time without shift-queueing leaves the builder idle between them, and that time is recorded. It is real idle time: the builder was waiting on the player.
 - A stretch ends when the builder dies or is given to another team. Air repair pads are left out; their build power only repairs aircraft.
+
+## Team files
+
+A team game is hard to read one player at a time. Teammates share resources (by hand, or above the share slider all game long), give each other units, take apart each other's buildings and help build each other's. In one player's file that is a stream of `received` and `sent` resources and units, and an economy that doesn't add up on its own. Taken together, the team plays as one player with several commanders, and that is what its file is: the same four blocks, for the whole team.
+
+- `build`: every player's rows in one block, by start time. A unit passed between two of the team's players is the team's throughout, so those `received`/`sent` rows are left out; units given to or by anyone outside the team stay. A player taking apart a teammate's building is the team reclaiming its own, so it gets a `-` row here, though in neither player's file.
+- Each starting commander is named for its player in place of its unit ID, `Armada Commander (Alice)`, wherever the ID appears (builders, assistants, `reclaimer_id`, `unit_id`), so it's clear whose is which. A player name is made a word for it: anything but letters, digits and `_` becomes `_`.
+- `resource`: the players' columns summed per second, as one pool; `wind_speed` is the map's. What the players sent each other cancels out, so `metal_received`/`energy_received` and `metal_sent`/`energy_sent` hold only what came from or went to someone outside the team: nothing, in a game where every ally is a teammate. A resource-sharing tax (a lobby option) is spent by the sender, so it shows in `metal_expense`/`energy_expense`.
+- `reclaim` and `idle`: every player's rows, by time. A builder given to a teammate has its idle stretch split in two at that moment.
+
+The metadata line has `team` and `players` and no `player` or `color`. A team with one player, a practice game included, gets no team file: its player's file is the same thing.
 
 ## Author
 
