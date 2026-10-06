@@ -68,7 +68,7 @@ Any text after the command is saved as the build order's name in the files, e.g.
 Each file holds all four kinds of data as four blocks. They are four different shapes — one row per unit event, one row per game second, one row per second per reclaiming unit, one row per idle stretch — so joining them into a single table would mean denormalizing three of them into a grain they don't fit. Instead each block opens with a blank line, a `## <name>` marker and its own header row:
 
 ```
-# buildOrderTracker	version=10	player=...	team=1	map=...
+# buildOrderTracker	version=11	player=...	team=1	map=...
 
 ## build
 unit_name	built_by	start_time	build_duration	unit_def
@@ -227,7 +227,7 @@ This means:
 
 ### The `idle` block
 
-One row per stretch of time a builder or factory spent idle, sorted by start time. A builder is idle when it has no orders queued (for a factory: nothing in its build queue) and isn't working on anything. The second half matters for nano turrets and other builders that assist or repair on their own without an order; they are only idle when they have nothing to do.
+One row per stretch of time a builder or factory spent idle, sorted by start time. A builder is idle when it has no orders queued (for a factory: nothing in its build queue), or only a guard order on something that has nothing to do itself, and isn't working on anything. The second half matters for nano turrets and other builders that assist or repair on their own without an order; they are only idle when they have nothing to do.
 
 | Column | Description |
 |---|---|
@@ -237,10 +237,11 @@ One row per stretch of time a builder or factory spent idle, sorted by start tim
 | `unit` | Translated builder name, e.g. `Construction Bot` |
 | `unit_def` | Internal builder name, e.g. `armck` |
 
-This is what separates the two kinds of gap between one of a builder's builds and its next: the part covered by an idle stretch is time it had no orders, and the rest is time it had orders but wasn't building yet, which is usually walking to the next build site.
+This is what separates the two kinds of gap between one of a builder's builds and its next: the part covered by an idle stretch is time it had nothing to do, and the rest is time it had orders but wasn't building yet, which is usually walking to the next build site.
 
 - Builders are polled five times a second, so a stretch's start and length are accurate to about 0.2 seconds.
-- A builder with a guard or patrol order is not idle, even when the factory it guards has nothing to build. Its guarding shows up as assist time in the `build` block instead.
+- A builder guarding a factory with nothing in its build queue is idle, and so is one guarding a constructor (or anything else) that has no orders and no work: a guard only helps, repairs and follows, so it has nothing to do either. Guards on guards are followed down the chain. While the factory builds, the guard's help shows up as assist time in the `build` block, and while it repairs, it isn't idle.
+- A builder guarding a unit that is on the move follows it, and that is not idle: it's walking. A builder with a patrol order is not idle either.
 - Giving orders one at a time without shift-queueing leaves the builder idle between them, and that time is recorded. It is real idle time: the builder was waiting on the player.
 - A stretch ends when the builder dies or is given to another team. Air repair pads are left out; their build power only repairs aircraft.
 

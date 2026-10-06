@@ -11,8 +11,8 @@ function widget:GetInfo()
 end
 
 
--- Export format version, written into each file's "#" metadata line. 6 records build priority (see priorityMark), 7 adds the idle block, 8 units given between allies, 9 mexes and geos replaced by their upgrade, 10 the player's team and a file per team (see exportTeam).
-local FORMAT_VERSION = 10
+-- Export format version, written into each file's "#" metadata line. 6 records build priority (see priorityMark), 7 adds the idle block, 8 units given between allies, 9 mexes and geos replaced by their upgrade, 10 the player's team and a file per team (see exportTeam), 11 a builder guarding something with nothing to do is idle (see hasNothingToDo).
+local FORMAT_VERSION = 11
 
 -- Localized Spring API
 local spGetSpectatingState = Spring.GetSpectatingState
@@ -40,6 +40,7 @@ local spGetUnitCurrentBuildPower = Spring.GetUnitCurrentBuildPower
 local spGetUnitMetalExtraction = Spring.GetUnitMetalExtraction
 local spGetUnitWorkerTask = Spring.GetUnitWorkerTask
 local spGetUnitCommandCount = Spring.GetUnitCommandCount
+local spGetUnitCurrentCommand = Spring.GetUnitCurrentCommand
 local spGetFactoryCommandCount = Spring.GetFactoryCommandCount
 local spFindUnitCmdDesc = Spring.FindUnitCmdDesc
 local spGetUnitCmdDescs = Spring.GetUnitCmdDescs
@@ -61,6 +62,7 @@ local ipairs = ipairs
 
 -- Localized CMD constants
 local CMD_RECLAIM = CMD.RECLAIM
+local CMD_GUARD = CMD.GUARD
 -- Build priority (the Builder Priority gadget): an ICON_MODE state on every builder that can be set passive, mode 0 = Low Prio, 1 = High Prio (the default)
 local CMD_PRIORITY = GameCMD and GameCMD.PRIORITY
 
@@ -308,18 +310,33 @@ local function workerTaskFeature(targetID)
 end
 
 
--- Whether a builder has nothing to do: no orders queued (for a factory, nothing in its build queue) and no worker task. The worker task is what keeps a nano turret, or a con left to its own devices, from counting as idle while it assists or repairs with no order given. A con with a guard or patrol order is not idle, even when the factory it guards has nothing to build.
+-- Whether a unit has nothing to do, its worker task aside (the caller's to check): no orders queued (for a factory, nothing in its build queue), or a guard order on something that has nothing to do itself. A guard on a factory with an empty queue, or on a con standing about, does nothing: the guard only assists, repairs and follows. A guard on a con that is walking follows it, and that is walking, not idle. seen holds the units the chain of guards has been through: a ring of them is units guarding each other with nothing to do.
+local function hasNothingToDo(unitID, unitDefID, seen)
+	if isFactory[unitDefID] then
+		return spGetFactoryCommandCount(unitID) == 0
+	end
+	if spGetUnitCommandCount(unitID) == 0 then
+		return true
+	end
+	local cmdID, _, _, targetID = spGetUnitCurrentCommand(unitID)
+	if cmdID ~= CMD_GUARD or not targetID or not spValidUnitID(targetID) then
+		return false
+	end
+	seen = seen or {}
+	seen[unitID] = true
+	if seen[targetID] then
+		return true
+	end
+	return not spGetUnitWorkerTask(targetID) and hasNothingToDo(targetID, spGetUnitDefID(targetID), seen)
+end
+
+
+-- Whether a builder is idle: nothing to do (see hasNothingToDo) and no worker task. The worker task is what keeps a nano turret, or a con left to its own devices, from counting as idle while it assists or repairs with no order given - and a guarding con while it helps or repairs. A con with a patrol order is not idle.
 local function isIdle(unitID, unitDefID, taskCmdID)
 	if taskCmdID or not tracksIdle[unitDefID] then
 		return false
 	end
-	local count
-	if isFactory[unitDefID] then
-		count = spGetFactoryCommandCount(unitID)
-	else
-		count = spGetUnitCommandCount(unitID)
-	end
-	return count == 0
+	return hasNothingToDo(unitID, unitDefID)
 end
 
 
